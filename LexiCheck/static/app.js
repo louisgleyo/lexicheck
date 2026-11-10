@@ -55,7 +55,7 @@ async function submitArticle(value) {
   if (!/LEGIARTI\d{12}/i.test(input)) return showError("Veuillez saisir un identifiant LEGIARTI valide ou une URL Légifrance contenant cet identifiant.");
   setLoading(true);
   try {
-    const resp = await fetch('/api/analyze', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({article:input})});
+    const resp = await fetch('/api/analyze', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({article:input,mode:document.querySelector('input[name="mode"]:checked')?.value||'actuel'})});
     const obj = await resp.json();
     if (!resp.ok) throw new Error(obj.erreur || 'Erreur de communication avec le serveur.');
     data = obj;
@@ -70,7 +70,7 @@ async function submitArticle(value) {
 function render() {
   if(!data)return;
   const c = data.comptes;
-  text($('date-pill'),`Vérification · ${friendlyDate(data.dateAnalyse)}`);
+  text($('date-pill'),`Vérification · ${friendlyDate(data.dateAnalyse)} · ${data.mode==='actuel'?'Version en vigueur':'Version fournie'}`);
   text($('stat-total'),data.renvois.length);
   text($('stat-alertes'),c.alerte);
   text($('stat-versions'),c.ancienne_version);
@@ -84,8 +84,11 @@ function render() {
   tags.append(make('span',{class:'micro-tag'},data.article.etat || 'État inconnu'));
   tags.append(make('span',{class:'micro-tag'},'N° ' + (data.article.numero || 'non renseigné')));
   src.append(tags);
-  if(data.sourceTexte) src.append(make('div',{class:'source-extract'},data.sourceTexte.length > 1600 ? data.sourceTexte.slice(0,1600) + '…' : data.sourceTexte));
-  const srcLink = make('a',{class:'source-link',href:officialUrl(data.article.id,'CODE'),target:'_blank',rel:'noopener noreferrer'},'Consulter sur Légifrance ↗');src.append(srcLink);
+  const versionLabel = data.mode==='actuel' ? 'Version en vigueur à la date du contrôle' : 'Version historique fournie';
+  src.append(make('div',{class:'source-note'},versionLabel));
+  if(data.versionChangee) src.append(make('p',{class:'source-switch-note'},`Version de l'URL : ${data.articleDemandee?.id} → version analysée : ${data.article.id}`));
+  const srcLink = make('a',{class:'source-link',href:officialUrl(data.article.id,data.sourceNature||'CODE'),target:'_blank',rel:'noopener noreferrer'},'Consulter sur Légifrance ↗');src.append(srcLink);
+  renderDocument();
   const issues = [...(data.avertissements||[])];
   if((data.mentionsNonResolues||[]).length)issues.push(`${data.mentionsNonResolues.length} mention(s) de type « article L. 123-1 » sans identifiant résolu, potentiellement à vérifier manuellement : ${data.mentionsNonResolues.slice(0,7).join(' ; ')}${data.mentionsNonResolues.length>7?'…':''}`);
   $('warnings-card').classList.toggle('hidden',issues.length===0);
@@ -93,6 +96,26 @@ function render() {
   renderResults();
   if(data.renvois.length) document.querySelector('.workspace').scrollIntoView({behavior:'smooth',block:'start'});
 }
+function renderDocument() {
+  if (!data) return;
+  const a = data.article;
+  text($('document-parent'), a.titre || 'Texte consolidé');
+  text($('document-heading'),`Article ${a.numero || 'sans numéro'}`);
+  let dates = a.dateDebut ? `Version du ${friendlyDate(a.dateDebut)}` : 'Version sélectionnée';
+  if (a.dateFin && !String(a.dateFin).startsWith('2999')) dates += ` au ${friendlyDate(a.dateFin)}`;
+  else dates += ' · En vigueur à la date du contrôle';
+  text($('document-dates'),dates);
+  const link=$('document-link'); link.href=officialUrl(a.id,data.sourceNature||'CODE'); link.hidden=false;
+  const banner=$('version-banner');
+  banner.classList.toggle('hidden',!data.versionChangee && data.mode!=='historique');
+  if(data.versionChangee) text(banner,`Version ancienne détectée (${data.articleDemandee?.id}). La rédaction affichée est celle en vigueur aujourd'hui (${a.id}).`);
+  else if(data.mode==='historique') text(banner,`Mode historique : vous examinez précisément la version ${a.id} fournie. Les statuts des renvois sont évalués aujourd'hui.`);
+  const body=$('document-body');
+  // HTML autorisé et échappé côté serveur par SafeArticleRenderer (aucun HTML PISTE brut).
+  body.innerHTML = data.sourceHtmlAnnote || '<p class="document-placeholder">Le contenu HTML de cet article n’est pas disponible via l’API.</p>';
+  text($('text-explanation'),`${data.renvoisSurlignes || 0} occurrence(s) de liens analysés surlignée(s). Cliquez sur une référence pour la consulter sur Légifrance.`);
+}
+
 function renderResults() {
   if(!data)return;
   const query = $('filter-text').value.trim().toLocaleLowerCase('fr');
@@ -100,7 +123,7 @@ function renderResults() {
   const list=$('results-list'); list.replaceChildren();
   if(!rows.length){list.append(make('div',{class:'empty-state'},'Aucun renvoi ne correspond à ce filtre.'));return;}
   for(const r of rows){
-    const wrap=make('article',{class:'result-item'});
+    const wrap=make('article',{class:'result-item',id:`reference-${r.id}`});
     const top=make('div',{class:'result-row'});
     const left=make('div');
     left.append(make('div',{class:'result-title'},r.titre || r.id));
@@ -135,11 +158,11 @@ function renderResults() {
 }
 function exportCsv() {
   if(!data)return;
-  const headers=['id_source','id_cible','titre_cible','statut','etat_API','date_debut','date_fin','sources','motif','version_actuelle','concordances_possibles'];
+  const headers=['id_saisi','id_source_analyse','mode','id_cible','titre_cible','statut','etat_API','date_debut','date_fin','sources','motif','version_actuelle','concordances_possibles'];
   const escapeCSV=v=>'"'+String(v??'').replace(/"/g,'""')+'"';
   const lines=[headers.join(';')];
   for(const r of data.renvois){
-    const vals=[data.article.id,r.id,r.titre,r.statut,r.etat,r.dateDebut,r.dateFin,(r.sources||[]).join('|'),r.raison,r.versionActuelle?.id||'',(r.concordances||[]).map(x=>x.id).join('|')];
+    const vals=[data.articleDemandee?.id||data.article.id,data.article.id,data.mode,r.id,r.titre,r.statut,r.etat,r.dateDebut,r.dateFin,(r.sources||[]).join('|'),r.raison,r.versionActuelle?.id||'',(r.concordances||[]).map(x=>x.id).join('|')];
     lines.push(vals.map(escapeCSV).join(';'));
   }
   const blob=new Blob(['\ufeff'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'});

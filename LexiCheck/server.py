@@ -125,6 +125,10 @@ class PisteClient:
                 raise APIError(f"Appel {endpoint} impossible : {exc}", 502) from exc
         raise APIError("Échec d'authentification.", 502)
 
+    def versions(self, cid: str) -> list[dict]:
+        payload = self.call("consult/getArticleByCid", {"cid": cid})
+        return flatten_versions(payload)
+
     def article(self, article_id: str) -> dict:
         with self._cache_lock:
             cached = self._article_cache.get(article_id)
@@ -216,6 +220,10 @@ def extract_references(article: dict, links: dict) -> tuple[list[dict], list[str
         entry["evidence"] = label or "Lien hypertexte dans le corps de l'article"
         if not entry.get("titre") or entry["titre"] == ident:
             entry["titre"] = label or ident
+        if "/codes/" in href and not entry.get("nature"):
+            entry["nature"] = "CODE"
+        elif "/loda/" in href and not entry.get("nature"):
+            entry["nature"] = "LODA"
 
     # Mentions textuelles non appariées à un identifiant : remontées à part, jamais déclarées vérifiées.
     plain = clean_text(source_html)
@@ -274,6 +282,180 @@ def article_summary(a: dict) -> dict:
             "cid": a.get("cid"), "titre": source_title(a)}
 
 
+
+
+def flatten_versions(payload: dict) -> list[dict]:
+    """Accepte aussi bien listArticle (articles complets) que articleVersions (résumés)."""
+    versions: dict[str, dict] = {}
+    for article in payload.get("listArticle", []) or []:
+        if not isinstance(article, dict):
+            continue
+        candidates = [article] + list(article.get("articleVersions") or [])
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            ident = str(item.get("id") or "").upper()
+            if not ARTICLE_RE.fullmatch(ident):
+                continue
+            # Une version complète a davantage de métadonnées qu'un résumé.
+            if ident not in versions or len(item) > len(versions[ident]):
+                versions[ident] = item
+    return list(versions.values())
+
+
+def live_version(article: dict, day: dt.date) -> bool:
+    state = normalize_state(article)
+    return active_on(article, day) and (state.startswith("VIGUEUR") or state == "MODIFIE")
+
+
+def choose_source_version(client: PisteClient, input_id: str, day: dt.date, mode: str) -> tuple[dict, dict, list[str]]:
+    """Ne jamais retomber silencieusement sur une version ancienne en mode actuel."""
+    if mode not in {"actuel", "historique"}:
+        raise APIError("Mode invalide : choisissez 'actuel' ou 'historique'.", 400)
+    originally = client.article(input_id)
+    notes = []
+    if mode == "historique":
+        notes.append("Mode version fournie : les renvois de cette rédaction sont vérifiés par rapport à la date d'analyse, pas à leur date de rédaction.")
+        return originally, originally, notes
+    if live_version(originally, day):
+        return originally, originally, notes
+    cid = str(originally.get("cid") or input_id).upper()
+    if not ARTICLE_RE.fullmatch(cid):
+        raise APIError("Impossible de retrouver l'identifiant chronologique (CID) de cet article. Essayez le mode « Version fournie ». ", 422)
+    try:
+        versions = client.versions(cid) if callable(getattr(client, "versions", None)) else flatten_versions(client.call("consult/getArticleByCid", {"cid": cid}))
+    except APIError as exc:
+        raise APIError("La recherche de la version actuelle a échoué : " + exc.message, exc.status) from exc
+    versions.append(originally)
+    current = [v for v in versions if live_version(v, day)]
+    current.sort(key=lambda v: parsed_date(v.get("dateDebut")) or dt.date.min, reverse=True)
+    if not current:
+        raise APIError("Aucune version en vigueur aujourd'hui n'a été identifiée par Légifrance pour cet article. Il peut avoir été abrogé ou renuméroté. Passez en mode « Version fournie » pour analyser sa rédaction historique.", 422)
+    winning = current[0]
+    if winning["id"] != input_id:
+        winning = client.article(winning["id"])
+        if not live_version(winning, day):
+            raise APIError("La version courante proposée n'a pas pu être confirmée. Analyse interrompue pour éviter un faux résultat.", 422)
+        notes.append(f"L'identifiant fourni ({input_id}) désigne une ancienne version. Analyse effectuée sur la version en vigueur ({winning['id']}).")
+    return winning, originally, notes
+
+
+class SafeArticleRenderer(HTMLParser):
+    """Reconstitue le HTML juridique en conservant seulement une liste de balises sûres.
+
+    Les références sont coloriées selon les contrôles, sans injecter le HTML brut de PISTE.
+    """
+    SAFE = {"p", "div", "span", "br", "ul", "ol", "li", "b", "strong", "i", "em", "u", "sup", "sub", "blockquote", "h2", "h3", "h4", "table", "thead", "tbody", "tr", "td", "th", "a"}
+    VOID = {"br"}
+    BLOCKED = {"script", "style", "iframe", "object", "embed", "svg", "math", "template", "form", "textarea", "button", "input"}
+    UNRESOLVED = re.compile(r"\barticles?\s+(?:L\.?|R\.?|D\.?|LO\.?|[A-Z]{1,3}\.?)\s*\d{1,5}(?:-\d{1,5}){0,4}", re.IGNORECASE)
+
+    def __init__(self, results: list[dict]):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.stack: list[tuple[str, str | None]] = []
+        self.blocked_depth = 0
+        self.link_depth = 0
+        self.by_id = {x["id"]: x for x in results}
+        self.count_highlighted = 0
+        self.mentioned_ids: set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs):
+        tag = tag.lower()
+        if self.blocked_depth:
+            if tag in self.BLOCKED:
+                self.blocked_depth += 1
+            return
+        if tag in self.BLOCKED:
+            self.blocked_depth = 1
+            return
+        if tag not in self.SAFE:
+            return
+        if tag == "a":
+            href = str(dict(attrs).get("href") or "")
+            hit = ARTICLE_RE.search(href) or OTHER_RE.search(href)
+            entry = self.by_id.get(hit.group(0).upper()) if hit else None
+            # Seuls les identifiants effectivement vérifiés sont codés en couleur.
+            if entry:
+                status = entry.get("statut", "indetermine")
+                if status not in {"vigoureux", "alerte", "ancienne_version", "indetermine"}:
+                    status = "indetermine"
+                uid = entry["id"]
+                dest = legal_article_url(uid, entry.get("nature", ""))
+                self.parts.append(f'<a class="legal-ref status-{status}" href="{html.escape(dest, quote=True)}" target="_blank" rel="noopener noreferrer" data-ref="{uid}" title="{html.escape(entry.get("raison", "Voir cette référence sur Légifrance"), quote=True)}">')
+                self.mentioned_ids.add(uid)
+                self.count_highlighted += 1
+            else:
+                # On garde la typographie, mais aucun attribut non vérifié.
+                self.parts.append('<span class="reference-unchecked" title="Lien non vérifié">')
+            self.stack.append(("a", "a" if entry else "span"))
+            self.link_depth += 1
+            return
+        self.parts.append(f"<{tag}>")
+        if tag not in self.VOID:
+            self.stack.append((tag, tag))
+
+    def handle_startendtag(self, tag: str, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag.lower() not in self.VOID:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str):
+        tag = tag.lower()
+        if self.blocked_depth:
+            if tag in self.BLOCKED:
+                self.blocked_depth -= 1
+            return
+        # Ignorer une fermeture inattendue plutôt que casser la structure.
+        for idx in range(len(self.stack) - 1, -1, -1):
+            if self.stack[idx][0] == tag:
+                for original, rendered in reversed(self.stack[idx:]):
+                    self.parts.append(f"</{rendered}>")
+                    if original == "a":
+                        self.link_depth = max(0, self.link_depth - 1)
+                del self.stack[idx:]
+                return
+
+    def handle_data(self, data: str):
+        if self.blocked_depth:
+            return
+        if self.link_depth:
+            self.parts.append(html.escape(data))
+            return
+        last = 0
+        for m in self.UNRESOLVED.finditer(data):
+            self.parts.append(html.escape(data[last:m.start()]))
+            self.parts.append('<mark class="legal-ref status-nonresolu" title="Mention textuelle sans identifiant résolu : vérification manuelle nécessaire">' + html.escape(m.group(0)) + '</mark>')
+            last = m.end()
+        self.parts.append(html.escape(data[last:]))
+
+    def render(self, markup: str) -> str:
+        self.feed(markup)
+        self.close()
+        for original, rendered in reversed(self.stack):
+            self.parts.append(f"</{rendered}>")
+        return "".join(self.parts)
+
+
+def legal_article_url(ident: str, nature: str = "") -> str:
+    if ident.startswith("JORFARTI"):
+        return f"https://www.legifrance.gouv.fr/jorf/id/{ident}"
+    if ident.startswith("LEGIARTI"):
+        group = "codes" if nature.upper() == "CODE" else "loda"
+        return f"https://www.legifrance.gouv.fr/{group}/article_lc/{ident}"
+    return "https://www.legifrance.gouv.fr/"
+
+
+def render_annotated_html(article: dict, checked: list[dict]) -> tuple[str, int, set[str]]:
+    raw = str(article.get("texteHtml") or article.get("texte") or "")
+    if not raw:
+        return "", 0, set()
+    if "<" not in raw:
+        raw = "<p>" + html.escape(raw).replace("\n", "<br>") + "</p>"
+    parser = SafeArticleRenderer(checked)
+    result = parser.render(raw[:300_000])
+    return result, parser.count_highlighted, parser.mentioned_ids
+
 def candidates_from_concordance(data: dict, old_id: str) -> list[dict]:
     seen: set[str] = set()
     result = []
@@ -311,15 +493,11 @@ def inspect_reference(client: PisteClient, entry: dict, today: dt.date) -> dict:
         versions = []
         if cid and ARTICLE_RE.fullmatch(str(cid).upper()):
             try:
-                result = client.call("consult/getArticleByCid", {"cid": cid})
-                for x in result.get("listArticle", []) or []:
-                    if isinstance(x, dict):
-                        versions.append(x)
-                        versions.extend(v for v in (x.get("articleVersions") or []) if isinstance(v, dict))
+                versions = client.versions(cid) if callable(getattr(client, "versions", None)) else flatten_versions(client.call("consult/getArticleByCid", {"cid": cid}))
             except APIError as exc:
                 res["notesVersions"] = exc.message
         versions.extend(x for x in (target.get("articleVersions") or []) if isinstance(x, dict))
-        current = [x for x in versions if active_on(x, today) and normalize_state(x).startswith("VIGUEUR")]
+        current = [x for x in versions if live_version(x, today)]
         # Certaines réponses sont des résumés incluant un CID mais pas le numéro d'article.
         current.sort(key=lambda x: parsed_date(x.get("dateDebut")) or dt.date.min, reverse=True)
         if current:
@@ -356,13 +534,13 @@ def inspect_reference(client: PisteClient, entry: dict, today: dt.date) -> dict:
     return res
 
 
-def analyze(client: PisteClient, value: str, today: dt.date | None = None) -> dict:
+def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode: str = "actuel") -> dict:
     today = today or dt.date.today()
     source_id = parse_article_id(value)
-    original = client.article(source_id)
-    warnings = []
+    original, supplied, warnings = choose_source_version(client, source_id, today, mode)
+    selected_id = str(original["id"])
     try:
-        links = client.call("consult/relatedLinksArticle", {"articleId": source_id})
+        links = client.call("consult/relatedLinksArticle", {"articleId": selected_id})
     except APIError as exc:
         links = {}
         warnings.append("Citations indexées indisponibles : " + exc.message)
@@ -375,9 +553,15 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None) -> di
         checked = list(pool.map(lambda entry: inspect_reference(client, entry, today), entries))
     checked.sort(key=lambda x: {"alerte": 0, "indetermine": 1, "ancienne_version": 2, "vigoureux": 3}.get(x["statut"], 4))
     counts = {key: sum(x["statut"] == key for x in checked) for key in ("alerte", "indetermine", "ancienne_version", "vigoureux")}
+    decorated, colored, actual_ids = render_annotated_html(original, checked)
     if not any("texte" in e["sources"] for e in entries):
-        warnings.append("Aucun hyperlien LEGI/JORF n'a été trouvé dans le HTML fourni : les citations indexées ne garantissent pas des renvois présents dans la rédaction.")
-    return {"article": article_summary(original), "sourceTexte": clean_text(str(original.get("texteHtml") or original.get("texte") or ""))[:14000],
+        warnings.append("Aucun hyperlien LEGI/JORF n'a été trouvé dans le HTML : les citations indexées ne garantissent pas que les renvois figurent dans la rédaction.")
+    if any(x["id"] not in actual_ids for x in checked):
+        warnings.append("Certaines références ne sont visibles que dans l'indexation Légifrance : elles ne sont pas surlignées dans le corps de l'article.")
+    source_nature = "CODE" if "/codes/" in value.lower() else ("LODA" if "/loda/" in value.lower() else "CODE")
+    return {"article": article_summary(original), "articleDemandee": article_summary(supplied),
+            "sourceNature": source_nature, "versionChangee": selected_id != source_id, "mode": mode,
+            "sourceHtmlAnnote": decorated, "renvoisSurlignes": colored,
             "dateAnalyse": today.isoformat(), "renvois": checked, "totalIdentifies": total, "comptes": counts,
             "mentionsNonResolues": unresolved, "avertissements": warnings,
             "limite": MAX_REFERENCES}
@@ -424,7 +608,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(count))
             if not isinstance(body, dict) or not isinstance(body.get("article"), str):
                 raise APIError("Fournir un champ article (URL ou identifiant).", 400)
-            result = analyze(CLIENT, body["article"])
+            result = analyze(CLIENT, body["article"], mode=body.get("mode", "actuel"))
             self._json(200, result)
         except APIError as exc:
             self._json(exc.status, {"erreur": exc.message})
