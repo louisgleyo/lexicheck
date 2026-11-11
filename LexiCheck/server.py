@@ -22,8 +22,9 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
+from code_catalog import OFFICIAL_CODE_TITLES
 
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.9.0"
 ROOT = Path(__file__).resolve().parent
 ARTICLE_RE = re.compile(r"LEGIARTI\d{12}", re.IGNORECASE)
 OTHER_RE = re.compile(r"(?:JORFARTI|KALIARTI)\d{12}", re.IGNORECASE)
@@ -162,17 +163,16 @@ class PisteClient:
 
 
     def search_article_number(self, number: str, code_name: str, day: dt.date) -> list[dict]:
-        """Retrouve le numéro dans un code, y compris ses versions abrogées.
+        """Recherche officielle par NUM_ARTICLE + NOM_CODE/TEXT_NOM_CODE.
 
-        IMPORTANT : les versions 'MODIFIE' peuvent être mort-nées (début > fin).
-        Une recherche CODE_ETAT ne garantit pas de retourner la version terminale.
-        On vérifie les articles et on cherche une version historique réellement
-        applicable avant de conclure. Les résultats ambigus restent ambigus.
+        Le libellé utilisé pour la recherche peut différer de sa mention
+        rédactionnelle (ex. « Code minier » / « Code minier (nouveau) »).
+        Les résultats sont vérifiés sur leur numéro ET leur code réel.
         """
         number = normalize_article_number(number)
         if not number or not code_name:
             return []
-        cache_key = (number, code_name.casefold(), day.isoformat())
+        cache_key = (number, normalize_code_title(code_name), day.isoformat())
         with self._cache_lock:
             cached_ids = self._lookup_cache.get(cache_key)
 
@@ -184,7 +184,8 @@ class PisteClient:
             if normalize_article_number(str(obj.get("num") or "")) != number:
                 return None
             titles = article_code_titles(obj)
-            if titles and not any(normalize_code_title(code_name) == normalize_code_title(t) for t in titles):
+            # Une absence de titre n'est pas une preuve d'appartenance au code.
+            if not titles or not any(code_title_verifies_reference(code_name, x) for x in titles):
                 return None
             return obj
 
@@ -193,37 +194,55 @@ class PisteClient:
             timestamp = int(dt.datetime.combine(day, dt.time(12), tzinfo=dt.timezone.utc).timestamp() * 1000)
 
             def search(fond: str, at_date: int | None):
-                filters = [{"facette": "NOM_CODE", "valeurs": [code_name]}]
-                if at_date is not None:
-                    filters.append({"facette": "DATE_VERSION", "singleDate": at_date})
-                body = {"fond": fond, "recherche": {
-                    "champs": [{"typeChamp": "NUM_ARTICLE", "criteres": [{
-                        "typeRecherche": "EXACTE", "valeur": number, "operateur": "ET"
-                    }], "operateur": "ET"}],
-                    "filtres": filters, "pageNumber": 1, "pageSize": 30,
-                    "operateur": "ET", "sort": "PERTINENCE", "typePagination": "ARTICLE"
-                }}
-                for ident in ids_in_search_response(self.call("search", body)):
-                    if ident in found or len(found) >= 40:
+                # PISTE utilise NOM_CODE pour CODE_DATE et TEXT_NOM_CODE
+                # pour CODE_ETAT (voir la FAQ officielle Légifrance).
+                facet = "TEXT_NOM_CODE" if fond == "CODE_ETAT" else "NOM_CODE"
+                labels = code_search_labels(code_name)
+                for code_label in labels:
+                    filters = [{"facette": facet, "valeurs": [code_label]}]
+                    if at_date is not None:
+                        filters.append({"facette": "DATE_VERSION", "singleDate": at_date})
+                    body = {"fond": fond, "recherche": {
+                        "champs": [{"typeChamp": "NUM_ARTICLE", "criteres": [{
+                            "typeRecherche": "EXACTE", "valeur": number, "operateur": "ET"
+                        }], "operateur": "ET"}],
+                        "filtres": filters, "pageNumber": 1, "pageSize": 30,
+                        "operateur": "ET", "sort": "PERTINENCE", "typePagination": "ARTICLE"
+                    }}
+                    try:
+                        result = self.call("search", body)
+                    except APIError:
+                        # Autre variante possible du nom du code.
+                        if code_label == labels[-1]:
+                            raise
                         continue
-                    obj = verified(ident)
-                    if obj is not None:
-                        found[ident] = obj
+                    before = len(found)
+                    for ident in ids_in_search_response(result):
+                        if ident in found or len(found) >= 40:
+                            continue
+                        obj = verified(ident)
+                        if obj is not None:
+                            found[ident] = obj
+                    if len(found) > before:
+                        break
 
-            # 1. Contrôle d'abord la situation actuelle, sans choisir un ID historique.
+            # Recherche en vigueur au jour demandé.
             search("CODE_DATE", timestamp)
             if not any(live_version(a, day) for a in found.values()):
-                # 2. Index des états, y compris les anciennes versions.
-                search("CODE_ETAT", None)
-                # 3. Si cet index ne prouve pas une abrogation, rechercher une
-                # version effectivement applicable avant l'abrogation. Cela évite
-                # notamment la version L212-36 'MODIFIE' aux dates inversées.
+                # Recherche des abrogations : filtre distinct dans CODE_ETAT.
+                try:
+                    search("CODE_ETAT", None)
+                except APIError:
+                    pass
                 if not any(terminal_abrogation(a, day) for a in found.values()):
                     for year in (2020, 2017, 2010, 2005):
                         if year >= day.year:
                             continue
                         old_at = int(dt.datetime(year, 1, 1, 12, tzinfo=dt.timezone.utc).timestamp() * 1000)
-                        search("CODE_DATE", old_at)
+                        try:
+                            search("CODE_DATE", old_at)
+                        except APIError:
+                            continue
                         if any(terminal_abrogation(a, day) for a in found.values()):
                             break
             ids = list(found)
@@ -232,7 +251,6 @@ class PisteClient:
                     self._lookup_cache.clear()
                 self._lookup_cache[cache_key] = ids
             return list(found.values())
-
         return [obj for ident in cached_ids if (obj := verified(ident)) is not None]
 
 
@@ -560,60 +578,169 @@ def article_code_titles(article: dict) -> list[str]:
     return titles
 
 
-# Noms complets, pour éviter de chercher « code du patrimoine et des articles ... ».
-# Les autres noms peuvent être ajoutés sans changer le moteur d'analyse.
-KNOWN_CODE_NAMES = (
-    "Code général des collectivités territoriales", "Code de la sécurité sociale",
-    "Code du patrimoine", "Code général des impôts", "Code civil",
-    "Code pénal", "Code de procédure pénale", "Code du travail",
-    "Code de l'éducation", "Code de la santé publique", "Code de l'environnement",
-    "Code de l'urbanisme", "Code de la construction et de l'habitation",
-    "Code de la commande publique", "Code des relations entre le public et l'administration",
-    "Code de la fonction publique", "Code général de la fonction publique",
-    "Code de commerce", "Code des transports", "Code de l'énergie",
-    "Code de justice administrative", "Code de procédure civile",
-    "Code rural et de la pêche maritime", "Code monétaire et financier",
-    "Code des assurances", "Code de la consommation", "Code du sport",
-    "Code des postes et des communications électroniques", "Code de la propriété intellectuelle",
-    "Code de la défense", "Code de l'action sociale et des familles",
-    "Code de la route", "Code du tourisme", "Code électoral",
-    "Code minier", "Code forestier", "Code des douanes",
-)
+def code_identity(title: str) -> str:
+    """Nom principal, sans le SEUL suffixe rédactionnel '(nouveau)'.
+
+    Ce nom sert à proposer des variantes de recherche. Il ne suffit
+    PAS à prouver que deux codes sont juridiquement identiques.
+    """
+    title = re.sub(r"\s*\(nouveau\)\s*$", "", str(title or ""), flags=re.I)
+    return normalize_code_title(title)
+
+
+def code_title_qualifier(title: str) -> str:
+    """Les qualificatifs historiques/édition sont conservés sans fusion."""
+    m = re.search(r"\(([^()]*)\)\s*$", str(title or ""))
+    return normalize_code_title(m.group(1)) if m else ""
+
+
+def same_code_title(left: str, right: str) -> bool:
+    """Reconnaissance générale de noms rédactionnels non qualifiés.
+
+    'Code forestier' peut désigner le code forestier (nouveau),
+    mais 'Code pénal (ancien)' ne désigne JAMAIS le Code pénal actuel.
+    """
+    return bool(left and right and code_identity(left) == code_identity(right))
+
+
+def code_title_verifies_reference(requested: str, official: str) -> bool:
+    """Preuve du nom du code dans les métadonnées de l'article.
+
+    Un qualificatif explicite dans le renvoi doit être respecté.
+    Sans qualificatif, un renvoi peut viser la rédaction ordinaire
+    ou le code '(nouveau)', sous réserve de son statut à la date examinée.
+    Les versions '(ancien)' et '(édition ...)' ne sont JAMAIS fusionnées.
+    """
+    if not requested or not official:
+        return False
+    if normalize_code_title(requested) == normalize_code_title(official):
+        return True
+    if code_title_qualifier(requested):
+        return False
+    # Seule la paire nom ordinaire / nom '(nouveau)' est tolérée.
+    # Ancien, édition, annexe et territoires distincts restent distincts.
+    return (same_code_title(requested, official)
+            and code_title_qualifier(official) in ('', 'nouveau'))
+
+
+def code_search_labels(title: str) -> list[str]:
+    """Variantes *génériques* à partir du catalogue officiel.
+
+    Un nom non qualifié privilégie le '(nouveau)' lorsqu'il existe,
+    puis tente son nom exact. Pas de branches propres à un code.
+    Un nom '(ancien)' ou '(édition ...)' n'est jamais transformé.
+    Une variante de recherche ne vaut PAS preuve d'identité.
+    """
+    name = str(title or '').strip()
+    if not name:
+        return []
+    key = normalize_code_title(name)
+    exact = next((c for c in OFFICIAL_CODE_TITLES if normalize_code_title(c) == key), name)
+    qualifier = code_title_qualifier(exact)
+    if qualifier and qualifier != 'nouveau':
+        return [exact]
+    common = [c for c in OFFICIAL_CODE_TITLES if code_identity(c) == code_identity(name)]
+    novelties = [c for c in common if code_title_qualifier(c) == 'nouveau']
+    unqualified = [c for c in common if not code_title_qualifier(c)]
+    if qualifier == 'nouveau':
+        return list(dict.fromkeys([exact] + unqualified))
+    if common:
+        # Recherche du code en vigueur actuel avant son ancienne forme
+        # lorsque le renvoi ne précise pas explicitement une édition.
+        return list(dict.fromkeys(novelties + [exact] + unqualified))
+    # Une famille qui n'existe qu'avec des éditions explicites (ex. :
+    # Code des marchés publics) ne doit pas être attribuée arbitrairement.
+    family = re.sub(r'\s*\([^()]*\)\s*$', '', name)
+    if any(re.sub(r'\s*\([^()]*\)\s*$', '', c) == family
+           for c in OFFICIAL_CODE_TITLES):
+        return [name]
+    # Pour un code nouvellement ajouté après l'édition du catalogue,
+    # tester aussi '(nouveau)' en vérifiant strictement les résultats.
+    return [name, name + ' (nouveau)']
+
+
+# Tous les intitulés officiels (historiques inclus), plus les formes
+# rédactionnelles abrégées pour les trois familles '(nouveau)'.
+# Aucune exception propre au Code minier ou à un autre code.
+KNOWN_CODE_NAMES = tuple(dict.fromkeys(
+    list(OFFICIAL_CODE_TITLES) + [
+        re.sub(r'\s*\(nouveau\)$', '', x, flags=re.I)
+        for x in OFFICIAL_CODE_TITLES if code_title_qualifier(x) == 'nouveau'
+    ]
+    + ['Code de la fonction publique']  # Variante usuelle, validée par la recherche.
+))
+def _code_name_pattern(name: str) -> str:
+    """Variantes typographiques (apostrophes et accents), sans perte d'offset."""
+    accents = {
+        'a': '[aàâäá]', 'e': '[eéèêë]', 'i': '[iîïí]',
+        'o': '[oôöó]', 'u': '[uùûüú]', 'c': '[cç]', 'y': '[yÿ]'
+    }
+    out = []
+    for ch in name:
+        low = unicodedata.normalize('NFKD', ch)
+        low = ''.join(c for c in low if not unicodedata.combining(c)).lower()
+        if ch in ("'", '’'):
+            out.append("['’]")
+        elif ch.isspace():
+            out.append(r'\s+')
+        elif low in accents:
+            out.append(accents[low])
+        else:
+            out.append(re.escape(ch))
+    return ''.join(out)
+
+
 CODE_NAMES_PATTERN = re.compile(r"(?<!\w)(?:" + "|".join(
-    re.escape(name).replace("\'", "['’]") for name in sorted(KNOWN_CODE_NAMES, key=len, reverse=True)
+    _code_name_pattern(name) for name in sorted(KNOWN_CODE_NAMES, key=len, reverse=True)
 ) + r")(?!\w)", re.IGNORECASE)
 
 
 def code_for_mention(full_text: str, position: int, source_article: dict) -> str | None:
-    """Ne résout un renvoi que si son code est explicite dans son contexte.
+    """Attribue un code uniquement dans la proposition locale du renvoi.
 
-    Cas classique : « articles L. ... et L. ... du code du patrimoine ».
-    On ne devine jamais le code sur la seule base du numéro.
+    Une mention explicite de code ne doit pas contaminer la proposition
+    suivante : « ... du code minier ; ... L. 4433-15-1. »
+    Sans nom de code dans la proposition, le renvoi non qualifié est lu
+    comme un renvoi au code de l'article source (si ce code est unique).
+    Les locutions « du même code » cherchent d'abord le dernier code cité.
     """
-    matches = list(CODE_NAMES_PATTERN.finditer(full_text[max(0, position-600):position+360]))
-    if not matches:
-        tail = full_text[max(0, position-75):position+45].lower()
-        if re.search(r"\b(?:du présent|du même|de ce) code\b", tail):
-            titles = article_code_titles(source_article)
-            return titles[0] if len(titles) == 1 and titles[0].lower().startswith("code ") else None
-        return None
-    start = max(0, position-600)
-    # Préférence au nom situé après le renvoi : « L. 212-33 du code du patrimoine ».
-    nearby = []
+    position = max(0, min(len(full_text), position))
+    boundaries_before = [full_text.rfind(ch, 0, position) for ch in (";", "\n")]
+    start = max(boundaries_before) + 1
+    boundaries_after = [x for ch in (";", "\n") if (x := full_text.find(ch, position)) >= 0]
+    end = min(boundaries_after) if boundaries_after else len(full_text)
+    clause = full_text[start:end]
+    mention_at = position - start
+    matches = list(CODE_NAMES_PATTERN.finditer(clause))
+    options = []
     for m in matches:
-        absolute = start + m.start()
-        dist = absolute - position
-        if 0 <= dist <= 270:
-            rank = dist
-        elif -240 <= dist < 0:
-            rank = 300 + abs(dist)
+        distance = m.start() - mention_at
+        if 0 <= distance <= 270:
+            score = distance
+        elif -240 <= distance < 0:
+            score = 300 + abs(distance)
         else:
             continue
-        nearby.append((rank, m.group()))
-    if not nearby:
+        options.append((score, m.group()))
+    if options:
+        raw_code = min(options, key=lambda t: t[0])[1]
+        return next((v for v in KNOWN_CODE_NAMES if normalize_code_title(v) == normalize_code_title(raw_code)), None)
+    near = clause.lower()
+    if re.search(r"\bdu même code\b", near):
+        prior_codes = list(CODE_NAMES_PATTERN.finditer(full_text[:start]))
+        if prior_codes:
+            previous = prior_codes[-1].group()
+            return next((v for v in KNOWN_CODE_NAMES if normalize_code_title(v) == normalize_code_title(previous)), None)
         return None
-    nearby.sort(key=lambda item: item[0])
-    return next((name for name in KNOWN_CODE_NAMES if normalize_code_title(name) == normalize_code_title(nearby[0][1])), None)
+    if re.search(r"\bdu présent code\b|\bde ce code\b", near):
+        titles = article_code_titles(source_article)
+        codes = [x for x in titles if x.casefold().startswith("code ")]
+        return codes[0] if len(codes) == 1 else None
+    # En l'absence d'un autre code qualifié DANS CETTE PROPOSITION,
+    # une référence « article L... » sans complément vise le même code.
+    titles = article_code_titles(source_article)
+    codes = [x for x in titles if x.casefold().startswith("code ")]
+    return codes[0] if len(codes) == 1 else None
 
 
 def resolve_textual_references(client: PisteClient, article: dict, entries: list[dict],
@@ -652,6 +779,7 @@ def resolve_textual_references(client: PisteClient, article: dict, entries: list
                 continue
             cids = {str(x.get("cid") or x.get("id")) for x in candidates}
             if len(cids) != 1 or not candidates:
+                warnings.append(f"Référence {pretty_article_number(number)} ({code}) non confirmée par PISTE : {len(cids)} article(s) distinct(s) retourné(s).")
                 continue
             # Ne jamais choisir une version « MODIFIE » mort-née avant la
             # véritable version terminale « ABROGE » du même article.
@@ -761,6 +889,12 @@ def extract_references(article: dict, links: dict) -> tuple[list[dict], list[str
     for mention in mentions:
         for number in mention["numbers"]:
             matches = by_number.get(number, [])
+            expected_code = code_for_mention(plain, mention["end"], article)
+            if expected_code:
+                matches = [e for e in matches if
+                           not CODE_NAMES_PATTERN.search(str(e.get("titre") or ""))
+                           or any(same_code_title(expected_code, m.group())
+                                  for m in CODE_NAMES_PATTERN.finditer(str(e.get("titre") or "")))]
             if len(matches) == 1:
                 entry = matches[0]
                 if "texte_litteral" not in entry["sources"]:
@@ -1613,7 +1747,7 @@ class Handler(BaseHTTPRequestHandler):
                  "/style.css": ("style.css", "text/css; charset=utf-8"),
                  "/mentions-legales": ("mentions-legales.html", "text/html; charset=utf-8")}
         if path == "/api/health":
-            return self._json(200, {"status": "ok", "version": APP_VERSION, "configured": bool(CLIENT.client_id and CLIENT.client_secret),
+            return self._json(200, {"status": "ok", "version": APP_VERSION, "build": "catalogue-officiel-generique-2026-11-11", "configured": bool(CLIENT.client_id and CLIENT.client_secret),
                                     "environment": os.getenv("PISTE_ENV", "production"),
                                     "protected": bool(os.getenv("APP_ACCESS_PASSWORD", ""))})
         if path.startswith("/api/jobs/"):

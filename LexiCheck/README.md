@@ -1,41 +1,41 @@
-# LexiCheck v3.7 — suggestions génériques, sans correctifs par article
+# LexiCheck v3.9 — catalogue officiel et noms de codes génériques
 
-Cette version remplace le moteur de proposition de corrections. **Aucun article, texte ou identifiant de remplacement n'est codé en dur.** Une proposition doit être justifiée par les liens de concordance effectivement retournés par l'API officielle Légifrance.
+**Changement par rapport à la v3.8 :** l'ancienne exception de recherche « Code minier » est supprimée. Les intitulés de codes proviennent maintenant d'un catalogue transversal : `code_catalog.py`, contenant les **108 intitulés** présentés dans [le répertoire Légifrance](https://www.legifrance.gouv.fr/liste/code) consulté le 11 novembre 2026 (y compris les codes historiques).
 
-## Fonctionnement
+## Règles d'attribution et de recherche
 
-1. LexiCheck extrait les mentions de l'article source : liens HTML, références en texte brut et plages d'articles ; pour les textes non codifiés, il tente d'identifier la loi, le décret ou l'ordonnance par son numéro.
-2. Il vérifie si l'article cité est toujours en vigueur, ou s'il existe une version actuelle du **même article** (même CID). Le simple changement de version `LEGIARTI` ne justifie pas une correction de référence.
-3. Pour un article réellement abrogé, remplacé ou indéterminé, il interroge **`/consult/concordanceLinksArticle`** sur sa version citée puis sur plusieurs versions historiques du même CID (lorsqu'elles sont connues).
-4. Il suit, si nécessaire, une chaîne de concordances entre articles historiques jusqu'à un article en vigueur. Les chemins et articles trouvés sont dédupliqués par CID juridique et conservés comme provenance.
-5. **Un seul successeur actuel** et un texte intégral rigoureusement identique (après suppression du HTML/espaces redondants) : « Correction proposée · rédaction identique ». Rédactions différentes : « Correction à vérifier ». Plusieurs successeurs, erreurs d'API ou recherche incomplète : **aucun remplacement automatique**.
-6. Les renvois réellement présents dans la rédaction restent distincts des liens seulement indexés. Les références impossibles à résoudre restent violettes.
+1. Le programme reconnaît les noms officiels des **108 codes**, y compris les apostrophes droites/courbes et certaines variations d'accents ; un code appartenant à un autre alinéa ne doit pas contaminer le suivant.
+2. Lorsque la rédaction cite un code sans qualifier « nouveau », les noms officiels compatibles sont essayés de façon **générique**. Il existe trois paires officiellement qualifiées `(nouveau)` : **Code forestier**, **Code de justice militaire**, **Code minier**. La version « nouveau » est recherchée en priorité lorsqu'elle figure dans le catalogue, puis l'intitulé non qualifié est essayé. Aucune branche n'est propre à un code.
+3. Le programme compare ensuite **le numéro d'article ET l'intitulé du code** renvoyés par l'API avant de retenir un identifiant. Une simple variante de nom **n'établit jamais** une équivalence juridique entre deux codes.
+4. Les mentions **`(ancien)`**, **`(édition 2001)`**, **`(édition 2006)`**, **`(1807)`**, ainsi que les **annexes du CGI** et les variantes territoriales sont maintenues distinctes. Exemple : « Code pénal (ancien) » ne doit pas être ramené au Code pénal actuel. Les différentes éditions du Code des marchés publics ne sont pas choisies par défaut.
+5. Lorsque deux articles distincts restent possibles, LexiCheck **ne choisit pas arbitrairement** : le renvoi est conservé comme ambigu. Pour un code apparu après la date du catalogue, il essaie le nom transmis et sa variante `(nouveau)` sans présumer du résultat.
+6. Les règles génériques de concordance et les contrôles des renvois de la v3.8 restent en place. Aucune suggestion de correction article→article issue d'un exemple sénatorial n'est codée en dur.
 
-### Limites techniques et juridiques
-
-- L'API **n'offre pas de table de concordance universelle, garantie exhaustive**. Si elle ne renvoie pas de successeur, LexiCheck indique qu'aucun successeur n'a été **confirmé** ; il n'invente pas de correction. L'article 3 de la loi n° 84-53 vers l'article L. 332-23 du CGFP *ne sera donc proposé que si les données API permettent réellement d'établir cette concordance*. La proposition précédemment injectée à la main a été supprimée.
-- Recherche des concordances volontairement **bornée** pour préserver les quotas PISTE (par défaut 9 appels et 3 niveaux de chaîne par référence, 5 versions initiales). Une recherche limitée ou interrompue est signalée comme partielle et ne donne pas de correction certaine. Paramètres : `CONCORDANCE_MAX_CALLS`, `CONCORDANCE_MAX_HOPS`, `CONCORDANCE_VERSION_PROBES`.
-- La recherche historique des lois non codifiées utilise désormais `LODA_ETAT` et un échantillonnage de dates **générique** (sans date de réforme privilégiée). Elle n'est pas exhaustive, notamment sur les lois très anciennes ; aucun numéro n'est associé à un texte différent sans vérification du titre du texte et de l'article.
-- Une identité textuelle **n'établit pas** une équivalence de portée juridique. Les corrections proposées doivent être vérifiées avant application.
+Le catalogue contient les **noms**, mais ni les dates d'effet consolidées ni une table de concordance entre codes. Un qualificatif éditorial n'implique pas l'identité juridique. Ce changement améliore la **résolution de la cible**, pas l'exhaustivité des concordances entre articles.
 
 ## Installation sur Render
 
-Remplacer dans le dépôt GitHub :
+Cette version ajoute **un nouveau fichier indispensable** `code_catalog.py`. À la **racine du dépôt GitHub** (au même endroit que `server.py`), ajouter/remplacer :
 
-- `server.py`
-- `static/app.js`
-- `static/index.html`
+- `server.py` — moteur Python ;
+- `code_catalog.py` — **nouveau catalogue des codes** ;
+- `static/app.js` — numéro de version du frontend ;
+- `static/index.html` — invalidation du cache navigateur.
 
-Conserver `static/style.css`, `static/mentions-legales.html`, les identifiants OAuth PISTE et les autres fichiers. Render : **Build Command** `echo "No dependencies"` et **Start Command** `python server.py` ; `HOST=0.0.0.0`.
+Les autres fichiers peuvent rester inchangés. Conserver les clés OAuth PISTE **exclusivement dans Render → Environment**. Les commandes Render restent : **Build** `echo "No dependencies"`, **Start** `python server.py`.
 
-Après déploiement, `https://votre-app.onrender.com/api/health` doit contenir `"version": "3.7.0"` ; actualiser le navigateur avec `Ctrl + F5`.
+Après le commit GitHub et le déploiement, `https://votre-site.onrender.com/api/health` doit indiquer :
 
-## Tests locaux
+```json
+{"status":"ok","version":"3.9.0","build":"catalogue-officiel-generique-2026-11-11"}
+```
+
+Les autres champs (`configured`, `protected`) sont propres à l'instance. Actualiser ensuite la page avec **Ctrl+F5**.
+
+## Tests
 
 ```bash
 python -m unittest discover -s tests -q
 ```
 
-Les tests utilisent des réponses PISTE **simulées**, sans aucune clé réelle. Ils couvrent notamment les concordances simples, les chaînes de transferts, l'historique d'un même CID, l'ambiguïté, les références non résolues et l'absence de correspondance. **Les appels effectifs à PISTE restent à valider sur l'instance déployée.**
-
-API officielle : https://www.legifrance.gouv.fr/contenu/pied-de-page/foire-aux-questions-api
+Les tests vérifient la présence des 108 intitulés, les trois suffixes `(nouveau)`, le maintien des versions `(ancien)` et éditions séparées, les accents/apostrophes, la portée locale des citations, et l'extraction via les formats JSON habituels. **Les réponses PISTE sont simulées** : ce correctif ne constitue pas une validation sur les identifiants ou les quotas de ta production. En cas d'échec de résolution réel, inspecter les avertissements de LexiCheck et la réponse de PISTE sans divulguer les secrets.

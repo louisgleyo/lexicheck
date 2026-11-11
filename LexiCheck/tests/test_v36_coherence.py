@@ -32,7 +32,7 @@ class Regression(unittest.TestCase):
         self.assertEqual([(x['numero'],x['texteNumero']) for x in norm],[('3','84-53')])
     def test_detect_law_even_if_search_empty(self):
         out=server.analyze(Fake(),SRC,DAY)
-        self.assertEqual(out['versionMoteur'],'3.7.0')
+        self.assertEqual(out['versionMoteur'],'3.9.0')
         # Plus aucune récupération avec un ID historique codé en dur.
         self.assertEqual(out['renvois'],[])
         self.assertEqual(out['comptes']['alerte'],0)

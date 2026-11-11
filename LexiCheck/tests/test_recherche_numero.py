@@ -40,7 +40,8 @@ class FakeClient:
         if endpoint=='search':
             value=data['recherche']['champs'][0]['criteres'][0]['valeur']
             code=data['recherche']['filtres'][0]['valeurs'][0]
-            assert code == 'Code du patrimoine'
+            if code != 'Code du patrimoine':
+                return {'results': []}
             if value=='L212-4':return {'results':[{'sections':[{'extracts':[{'id':CURRENT}]}]}]}
             if value=='L212-33' and data['fond']=='CODE_DATE' and len(data['recherche']['filtres'])==2:
                 # Le 11 novembre 2026, la disposition est abrogée : aucun résultat.
@@ -73,12 +74,14 @@ class LookupTests(unittest.TestCase):
         self.assertIn('status-alerte',result['sourceHtmlAnnote'])
         self.assertIn('status-vigoureux',result['sourceHtmlAnnote'])
 
-    def test_no_code_in_context_means_no_assumption(self):
+    def test_unqualified_reference_uses_source_code_but_not_foreign_code(self):
         c=FakeClient()
         c.db[SOURCE]['texteHtml']='<p>Se reporter à l’article L. 212-4.</p>'
         res=server.analyze(c,SOURCE,OLD_DATE)
         self.assertEqual(res['mentionsNonResolues'],['article L. 212-4'])
-        self.assertFalse(any(ep=='search' for ep,_ in c.calls))
+        searches=[b for ep,b in c.calls if ep=='search']
+        self.assertTrue(searches)
+        self.assertTrue(all(b['recherche']['filtres'][0]['valeurs'][0]=='Code général des collectivités territoriales' for b in searches))
 
     def test_ambiguous_results_remain_unresolved(self):
         c=FakeClient()

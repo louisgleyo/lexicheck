@@ -1,5 +1,5 @@
 'use strict';
-const FRONTEND_VERSION = '3.7.0';
+const FRONTEND_VERSION = '3.9.0';
 const $ = id => document.getElementById(id);
 let kind = 'article';
 let outline = null;
@@ -23,7 +23,7 @@ function official(id,kind='CODE'){if(/^LEGIARTI\d{12}$/.test(id))return `https:/
 function authHeaders(){return {'X-LexiCheck-Access':$('app-password').value||''}}
 async function post(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json',...authHeaders()},body:JSON.stringify(body)});let d;try{d=await r.json()}catch{throw Error('Réponse serveur illisible.')}if(!r.ok)throw Error(d.erreur||`Erreur HTTP ${r.status}`);return d}
 function setBusy(yes){$('primary-btn').disabled=yes;setText('primary-btn',yes?'Chargement…':kind==='article'?'Analyser →':'Charger le sommaire →')}
-async function checkHealth(){try{const d=await(await fetch('/api/health')).json();setText('connection',(d.configured?'PISTE connecté':'PISTE non configuré')+' · v'+(d.version||'?'));hide('password-option',!d.protected)}catch{setText('connection','Serveur indisponible')}}
+async function checkHealth(){try{const d=await(await fetch('/api/health')).json();setText('connection',(d.configured?'PISTE connecté':'PISTE non configuré')+' · moteur v'+(d.version||'?'));hide('password-option',!d.protected);if(d.version!==FRONTEND_VERSION){error(`Déploiement incohérent : page v${FRONTEND_VERSION}, serveur v${d.version||'?'}. Vérifie /api/health et les fichiers GitHub.`);$('primary-btn').disabled=true}}catch{setText('connection','Serveur indisponible')}}
 function reset(){outline=null;selectedOutline=null;rows=[];singleDetail=null;offset=0;stopped=true;running=false;hide('outline-panel');hide('progress-panel');hide('results');hide('reader');clearError()}
 function changeKind(value){kind=value;document.querySelectorAll('.scope').forEach(b=>b.classList.toggle('active',b.dataset.kind===value));reset();setText('url-label',value==='article'?"Lien ou identifiant de l'article":value==='section'?'Lien Légifrance d’un titre ou d’une section':'Lien Légifrance du code');$('url-input').placeholder=value==='article'?'https://www.legifrance.gouv.fr/codes/article_lc/LEGIARTI…':value==='section'?'https://www.legifrance.gouv.fr/codes/section_lc/LEGITEXT…/LEGISCTA…':'https://www.legifrance.gouv.fr/codes/texte_lc/LEGITEXT…';hide('history-option',value!=='article');setText('input-help',value==='article'?'La version en vigueur est analysée par défaut.':'Données à la date du jour. Les codes sont parcourus par lots.');setBusy(false)}
 function summaryFor(detail){return {id:detail.article.id,titre:detail.article.titre,numero:detail.article.numero,comptes:detail.comptes,totalIdentifies:detail.totalIdentifies,limite:detail.limite,renvois:detail.renvois.filter(r=>r.statut!=='vigoureux'),avertissements:detail.avertissements}}
