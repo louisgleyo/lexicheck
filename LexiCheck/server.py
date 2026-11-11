@@ -23,7 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.7.0"
 ROOT = Path(__file__).resolve().parent
 ARTICLE_RE = re.compile(r"LEGIARTI\d{12}", re.IGNORECASE)
 OTHER_RE = re.compile(r"(?:JORFARTI|KALIARTI)\d{12}", re.IGNORECASE)
@@ -34,6 +34,9 @@ JOB_BATCH_MAX = max(5, min(int(os.environ.get("JOB_BATCH_MAX", "40")), 100))
 BULK_REF_LIMIT = max(1, min(int(os.environ.get("BULK_REF_LIMIT", "25")), 100))
 AUTO_RESOLVE_LIMIT = max(0, min(int(os.environ.get("AUTO_RESOLVE_LIMIT", "20")), 60))
 AUTO_RESOLVE_BULK_LIMIT = max(0, min(int(os.environ.get("AUTO_RESOLVE_BULK_LIMIT", "6")), 20))
+CONCORDANCE_MAX_CALLS = max(1, min(int(os.environ.get("CONCORDANCE_MAX_CALLS", "9")), 20))
+CONCORDANCE_MAX_HOPS = max(1, min(int(os.environ.get("CONCORDANCE_MAX_HOPS", "3")), 4))
+CONCORDANCE_VERSION_PROBES = max(1, min(int(os.environ.get("CONCORDANCE_VERSION_PROBES", "5")), 10))
 
 
 def load_dotenv() -> None:
@@ -289,16 +292,35 @@ class PisteClient:
 
         fetch("LODA_DATE", day)
         if not any(live_version(a, day) for a in found.values()):
-            # Les textes abrogés peuvent n'apparaître que pour une date passée.
-            # Priorité à 2022 pour la codification de la fonction publique.
-            for past in (dt.date(2022, 2, 28), dt.date(2020, 1, 1),
-                         dt.date(2017, 1, 1), dt.date(2012, 1, 1),
-                         dt.date(2005, 1, 1), dt.date(1995, 1, 1)):
-                if past >= day:
-                    continue
-                fetch("LODA_DATE", past)
-                if any(terminal_abrogation(a, day) for a in found.values()):
-                    break
+            # Recherche d'état juridique sur l'ensemble du fonds LODA,
+            # puis exploration historique bornée. Aucune année de réforme spéciale.
+            try:
+                fetch("LODA_ETAT", None)
+            except APIError:
+                pass  # Certains filtres sont refusés : le balayage par dates reste possible.
+            if not any(terminal_abrogation(a, day) for a in found.values()):
+                # Années génériques : années récentes, puis pas de 3/5 ans jusqu'à
+                # l'année de l'acte (si déterminable depuis son numéro).
+                digits = int(text_number.split("-", 1)[0])
+                year_of_text = digits if digits >= 1000 else (2000 + digits if digits <= day.year % 100 else 1900 + digits)
+                earliest = max(1800, min(year_of_text, day.year))
+                samples = [day.year - 1, day.year - 3, day.year - 5]
+                samples.extend(range(day.year - 8, earliest - 1, -5))
+                samples.append(earliest)
+                seen_years = set()
+                for year in samples[:14]:
+                    if year < earliest or year in seen_years:
+                        continue
+                    seen_years.add(year)
+                    past = dt.date(year, 7, 1)
+                    if past >= day:
+                        continue
+                    try:
+                        fetch("LODA_DATE", past)
+                    except APIError:
+                        continue
+                    if any(terminal_abrogation(a, day) for a in found.values()):
+                        break
         with self._cache_lock:
             if len(self._lookup_cache) > 500:
                 self._lookup_cache.clear()
@@ -401,7 +423,7 @@ RANGE_RE = re.compile(
 )
 MAX_RANGE_ARTICLES = max(2, min(int(os.environ.get("MAX_RANGE_ARTICLES", "40")), 80))
 
-# Renvois vers les textes autonomes : « l'article 3 de la loi n° 84-53 ».
+# Renvois vers les textes autonomes : « l'article 7 de la loi n° 90-111 ».
 # Les subdivisions 1° et 2° qui précèdent l'article sont conservées dans le
 # texte affiché, mais ne doivent PAS être interprétées comme les articles 1 et 2.
 NORMATIVE_RE = re.compile(
@@ -650,7 +672,7 @@ def resolve_textual_references(client: PisteClient, article: dict, entries: list
 def resolve_normative_references(client: PisteClient, article: dict, entries: list[dict],
                                  unresolved: list[str], day: dt.date, bulk: bool
                                  ) -> tuple[list[dict], list[str], list[str]]:
-    """Résout « article 3 de la loi n°84-53 » sans confondre avec un code."""
+    """Résout les numéros d’articles de lois/décrets sans les confondre avec des codes."""
     plain = cohesive_text(str(article.get("texteHtml") or article.get("texte") or ""))
     mentions = normative_mentions(plain)
     if not mentions:
@@ -673,22 +695,6 @@ def resolve_normative_references(client: PisteClient, article: dict, entries: li
         except APIError as exc:
             candidates = []
             warnings.append("Recherche d'un texte non codifié indisponible : " + exc.message)
-        # Documentation du cas-test : article 3 de la loi 84-53. Lorsque
-        # l'index /search ne retrouve rien, interroger l'ID historique connu,
-        # puis ne le retenir QUE si getArticle confirme numéro, texte et état.
-        # Il ne s'agit pas d'une concordance déduite par l'API.
-        if not candidates and key == ("3", "84-53", "loi"):
-            known_id = "LEGIARTI000038922660"
-            try:
-                known = client.article(known_id)
-                labels = article_code_titles(known)
-                if (str(known.get("num") or "").strip() == "3"
-                    and any(re.search(r"(?<!\d)84[-‑]53(?!\d)", t, re.I)
-                            and "loi" in t.lower() for t in labels)):
-                    candidates = [known]
-                    warnings.append("Article 3 de la loi n° 84-53 : identifiant historique confirmé par consultation directe après échec de la recherche par numéro.")
-            except (APIError, KeyError, AssertionError):
-                pass
         cids = {str(x.get("cid") or x.get("id")) for x in candidates}
         if len(cids) != 1 or not candidates:
             if mention["raw"] not in unresolved:
@@ -1109,6 +1115,11 @@ def render_annotated_html(article: dict, checked: list[dict]) -> tuple[str, int,
     return result, parser.count_highlighted, parser.mentioned_ids
 
 def candidates_from_concordance(data: dict, old_id: str) -> list[dict]:
+    """Liens sortants `newTexts`, jamais `oldTexts` (sens inverse).
+
+    On ne prend que des identifiants ARTICLE LEGI : un lien vers un texte
+    entier ou un modificateur ne constitue pas une équivalence d'article.
+    """
     seen: set[str] = set()
     result = []
     for entry in data.get("newTexts", []) or []:
@@ -1118,9 +1129,97 @@ def candidates_from_concordance(data: dict, old_id: str) -> list[dict]:
         if not ARTICLE_RE.fullmatch(ident) or ident == old_id or ident in seen:
             continue
         seen.add(ident)
+        types = [str(x.get("type") or "") for x in entry.get("modifications", []) or [] if isinstance(x, dict)]
         result.append({"id": ident, "titre": entry.get("name") or ident,
-                       "type": ", ".join(str(x.get("type", "")) for x in entry.get("modifications", []) if isinstance(x, dict))})
-    return result[:12]
+                       "type": ", ".join(types), "nature": entry.get("nature") or ""})
+    return result
+
+
+def discover_successors(client: PisteClient, old_article: dict, day: dt.date,
+                        history: list[dict] | None = None) -> dict:
+    """Explore génériquement les concordances officielles d'un article.
+
+    Recherche sur plusieurs versions du même CID, puis suit les transferts
+    successifs. Budget de requêtes limité pour maîtriser le quota PISTE.
+    Un résultat ambigu ou partiel ne devient JAMAIS une correction certaine.
+    """
+    from collections import deque
+    ident = str(old_article.get("id") or "").upper()
+    cid = str(old_article.get("cid") or ident).upper()
+    # Original d'abord, puis versions historiques terminales les plus récentes.
+    records = list(history or []) + list(old_article.get("articleVersions") or [])
+    ordered = sorted((v for v in records if isinstance(v, dict)
+                      and ARTICLE_RE.fullmatch(str(v.get("id") or "").upper())
+                      and (parsed_date(v.get("dateDebut")) or dt.date.min) <= day),
+                     key=lambda v: parsed_date(v.get("dateFin")) or dt.date.min, reverse=True)
+    seeds = [ident]
+    for version in ordered:
+        vid = str(version["id"]).upper()
+        if vid not in seeds and len(seeds) < CONCORDANCE_VERSION_PROBES:
+            seeds.append(vid)
+    more_versions = bool(len({str(v.get("id")).upper() for v in ordered}) > len(seeds))
+    queue = deque((sid, [sid], 0) for sid in seeds)
+    visited: set[str] = set()
+    destinations: dict[str, dict] = {}
+    failures: list[str] = []
+    calls = 0
+    truncated = more_versions
+    while queue:
+        if calls >= CONCORDANCE_MAX_CALLS:
+            truncated = True
+            break
+        source_id, path, depth = queue.popleft()
+        if source_id in visited:
+            continue
+        visited.add(source_id)
+        calls += 1
+        try:
+            data = client.call("consult/concordanceLinksArticle", {"articleId": source_id})
+        except APIError as exc:
+            failures.append(f"{source_id}: {exc.message}")
+            continue
+        outgoing = candidates_from_concordance(data, source_id)
+        for item in outgoing:
+            next_id = item["id"]
+            if next_id in path:
+                continue
+            try:
+                candidate = client.article(next_id)
+            except (APIError, KeyError):
+                failures.append(f"Identifiant non consultable : {next_id}")
+                continue
+            # Un nouveau LEGIARTI du même CID est une autre VERSION du même
+            # article. Ce n'est pas un renvoi à modifier juridiquement.
+            new_cid = str(candidate.get("cid") or next_id).upper()
+            if new_cid == cid:
+                continue
+            current = candidate
+            if not live_version(current, day):
+                try:
+                    versions = client.versions(new_cid) if callable(getattr(client, "versions", None)) else flatten_versions(client.call("consult/getArticleByCid", {"cid": new_cid}))
+                    live = [v for v in versions if live_version(v, day)]
+                    if live:
+                        live.sort(key=lambda v: parsed_date(v.get("dateDebut")) or dt.date.min, reverse=True)
+                        current = client.article(str(live[0]["id"]).upper())
+                except (APIError, KeyError):
+                    pass
+            new_path = path + [next_id]
+            if live_version(current, day):
+                dest_id = str(current.get("id") or "").upper()
+                if ARTICLE_RE.fullmatch(dest_id):
+                    # Déduplication par CID juridique, non par LEGIARTI/version.
+                    k = str(current.get("cid") or dest_id).upper()
+                    if k not in destinations or len(new_path) < len(destinations[k]["parcours"]):
+                        destinations[k] = {"id": dest_id, "titre": item.get("titre"),
+                                           "type": item.get("type"), "nature": item.get("nature"),
+                                           "parcours": new_path,
+                                           "source": "Concordances Légifrance (API)"}
+            elif depth + 1 < CONCORDANCE_MAX_HOPS and next_id not in visited:
+                queue.append((next_id, new_path, depth + 1))
+            elif depth + 1 >= CONCORDANCE_MAX_HOPS:
+                truncated = True
+    return {"candidats": list(destinations.values()), "versionsExaminees": seeds,
+            "appels": calls, "partiel": truncated or bool(failures), "erreurs": failures[:3]}
 
 
 def comparable_content(article: dict) -> str:
@@ -1134,7 +1233,8 @@ def comparable_content(article: dict) -> str:
 
 def propose_replacement(client: PisteClient, old_article: dict, candidates: list[dict], day: dt.date) -> dict:
     """Comparaison lexicale stricte, sans inférence juridique ni choix arbitraire."""
-    output = {"statut": "aucune", "libelle": "Pas de remplacement certain", "candidats": []}
+    output = {"statut": "aucune", "libelle": "Aucun successeur en vigueur confirmé", "candidats": [],
+              "source": "Concordances Légifrance (API)"}
     if not candidates:
         return output
     old_text = comparable_content(old_article)
@@ -1175,6 +1275,8 @@ def propose_replacement(client: PisteClient, old_article: dict, candidates: list
                         excerpt_old = old_text[:200]
                         excerpt_new = new_text[:200]
             results.append({"id": article.get("id") or ident, "numero": article.get("num"),
+                            "nature": item.get("nature") or ("CODE" if article_code_titles(article) and any("code" in t.lower() for t in article_code_titles(article)) else "LODA"),
+                            "parcours": item.get("parcours", []),
                             "enVigueur": current, "identique": identity, "similarite": similarity,
                             "texteDisponible": bool(old_text and new_text),
                             "extraitAncien": excerpt_old, "extraitNouveau": excerpt_new})
@@ -1187,10 +1289,10 @@ def propose_replacement(client: PisteClient, old_article: dict, candidates: list
     live = [x for x in results if x["enVigueur"]]
     if len(live) == 1 and len(results) == 1 and live[0]["identique"]:
         output.update({"statut": "proposition", "libelle": "Correction proposée · rédaction identique",
-                       "id": live[0]["id"], "identique": True})
+                       "id": live[0]["id"], "nature": live[0].get("nature", ""), "identique": True})
     elif len(live) == 1 and len(results) == 1:
         output.update({"statut": "verification", "libelle": "Correction à vérifier · rédaction différente ou indisponible",
-                       "id": live[0]["id"], "identique": False})
+                       "id": live[0]["id"], "nature": live[0].get("nature", ""), "identique": False})
     elif live:
         output.update({"statut": "ambigu", "libelle": "Plusieurs concordances · pas de correction automatique"})
     return output
@@ -1233,7 +1335,7 @@ def inspect_reference(client: PisteClient, entry: dict, today: dt.date) -> dict:
                 res["statut"] = "ancienne_version"
                 res["raison"] = "L'identifiant cité désigne une version antérieure, mais l'article possède une version actuellement en vigueur."
                 version_info = propose_replacement(client, target, [{"id": winning["id"]}], today)
-                version_info.update({"statut": "version", "libelle": "Version actuelle du même article · aucun changement de référence nécessaire", "id": winning["id"]})
+                version_info.update({"statut": "version", "libelle": "Version actuelle du même article · aucun changement de référence nécessaire", "id": winning["id"], "source": "Historique des versions Légifrance"})
                 res["suggestion"] = version_info
             else:
                 res["statut"] = "vigoureux"
@@ -1254,14 +1356,23 @@ def inspect_reference(client: PisteClient, entry: dict, today: dt.date) -> dict:
             res["statut"] = "indetermine"
             res["raison"] = "Statut non concluant : date d'entrée en vigueur future, historique incomplet ou état non reconnu."
         if res["statut"] != "vigoureux":
-            try:
-                concordance = client.call("consult/concordanceLinksArticle", {"articleId": ident})
-                res["concordances"] = candidates_from_concordance(concordance, ident)
-                if res["concordances"]:
-                    res["raison"] += " Une correspondance possible est renseignée par Légifrance (non validée juridiquement)."
-                    res["suggestion"] = propose_replacement(client, target, res["concordances"], today)
-            except APIError as exc:
-                res["notesConcordance"] = exc.message
+            trace = discover_successors(client, target, today, versions)
+            res["rechercheSuccesseur"] = {k: trace[k] for k in ("appels", "partiel", "versionsExaminees", "erreurs")}
+            res["concordances"] = trace["candidats"]
+            if trace["candidats"]:
+                res["raison"] += " Concordance officielle vers un article en vigueur trouvée."
+                suggestion = propose_replacement(client, target, trace["candidats"], today)
+                # Une recherche tronquée ou échouée peut masquer d'autres
+                # successeurs : jamais une substitution unique dans ce cas.
+                if trace["partiel"]:
+                    suggestion.pop("id", None)
+                    suggestion.update({"statut": "ambigu", "libelle":
+                                      "Correspondance(s) trouvée(s), recherche incomplète · à vérifier"})
+                res["suggestion"] = suggestion
+            elif trace["partiel"]:
+                res["raison"] += " Recherche de concordances incomplète (quota, erreur ou limite)."
+            else:
+                res["raison"] += " Aucune correspondance officielle vers un article en vigueur trouvée."
     except APIError as exc:
         res["raison"] = exc.message
     return res
@@ -1292,30 +1403,6 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
         entries = entries[:ref_limit]
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         checked = list(pool.map(lambda entry: inspect_reference(client, entry, today), entries))
-    # Une correspondance explicitement documentée dans un rapport parlementaire
-    # peut être affichée à titre de suggestion vérifiable, mais PAS comme une
-    # correction déduite automatiquement de l'identité des deux rédactions.
-    source_num = normalize_article_number(str(original.get("num") or ""))
-    source_is_cgct = any(normalize_code_title(x) == normalize_code_title("Code général des collectivités territoriales")
-                         for x in article_code_titles(original))
-    for ref in checked:
-        if (source_is_cgct and source_num in {"L4141-2", "L3131-2"}
-            and ref.get("numero") == "3" and ref.get("texteNumero") == "84-53"
-            and ref.get("typeTexte") == "loi" and ref.get("statut") == "alerte"):
-            target_id = "LEGIARTI000044426650"  # Code général de la fonction publique, L332-23
-            try:
-                target = client.article(target_id)
-                if live_version(target, today) and normalize_article_number(str(target.get("num") or "")) == "L332-23":
-                    comparison = propose_replacement(client, client.article(ref["id"]),
-                                                     [{"id": target_id}], today)
-                    comparison.update({"statut": "verification", "id": target_id,
-                                       "nature": "CODE",
-                                       "libelle": "Correction à vérifier · remplacement préconisé par le Sénat",
-                                       "sourceDocumentaire": "https://www.senat.fr/rap/l23-260/l23-2604.html",
-                                       "referenceRecommandee": "I de l'article L. 332-23 du code général de la fonction publique"})
-                    ref["suggestion"] = comparison
-            except APIError:
-                pass
     checked.sort(key=lambda x: {"alerte": 0, "indetermine": 1, "ancienne_version": 2, "vigoureux": 3}.get(x["statut"], 4))
     # Même critère pour un article isolé ET pour les lots : un lien indexé
     # sans preuve dans la rédaction ne gonfle jamais les statistiques.
@@ -1338,19 +1425,6 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
             warnings.append(f"{len(index_only)} lien(s) de l'indexation Légifrance sans citation textuelle confirmée : présentés séparément, non comptés comme anomalies du texte.")
         if unresolved:
             warnings.append(f"{len(unresolved)} référence(s) textuelle(s) non résolue(s) : affichées en violet (statut inconnu).")
-    # La recommandation sénatoriale est distincte de la vérification API :
-    # la présenter, même si l'article 3 de 1984 n'a pas pu être identifié.
-    documented_corrections = []
-    if not bulk and source_is_cgct and source_num in {"L4141-2", "L3131-2"}:
-        for m in normative_mentions(cohesive_text(raw_source)):
-            if (m["numero"], m["texteNumero"], m["typeTexte"]) == ("3", "84-53", "loi"):
-                if not any(x.get("texteNumero") == "84-53" and x.get("numero") == "3" for x in in_text):
-                    documented_corrections.append({
-                        "mention": m["raw"], "statut": "non_resolu",
-                        "referenceRecommandee": "I de l'article L. 332-23 du code général de la fonction publique",
-                        "sourceDocumentaire": "https://www.senat.fr/rap/l23-260/l23-2604.html",
-                        "message": "Correction proposée par le Sénat ; la référence de 1984 n'a pas pu être vérifiée dans l'API."
-                    })
     counts = {key: sum(x["statut"] == key for x in in_text) for key in ("alerte", "indetermine", "ancienne_version", "vigoureux")}
     source_nature = "CODE" if "/codes/" in value.lower() else ("LODA" if "/loda/" in value.lower() else "CODE")
     return {"article": article_summary(original), "articleDemandee": article_summary(supplied),
@@ -1358,7 +1432,7 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
             "sourceHtmlAnnote": decorated, "renvoisSurlignes": colored,
             "dateAnalyse": today.isoformat(), "versionMoteur": APP_VERSION,
             "renvois": in_text, "liensIndexationSeule": index_only,
-            "correctionsDocumentees": documented_corrections,
+            "correctionsDocumentees": [],
             "totalIdentifies": total, "comptes": counts,
             "mentionsNonResolues": unresolved, "avertissements": warnings,
             "limite": ref_limit}

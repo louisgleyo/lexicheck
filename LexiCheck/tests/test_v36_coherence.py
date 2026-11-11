@@ -32,20 +32,20 @@ class Regression(unittest.TestCase):
         self.assertEqual([(x['numero'],x['texteNumero']) for x in norm],[('3','84-53')])
     def test_detect_law_even_if_search_empty(self):
         out=server.analyze(Fake(),SRC,DAY)
-        self.assertEqual(out['versionMoteur'],'3.6.0')
-        self.assertEqual([x['id'] for x in out['renvois']],[OLD])
-        self.assertEqual(out['comptes']['alerte'],1)
+        self.assertEqual(out['versionMoteur'],'3.7.0')
+        # Plus aucune récupération avec un ID historique codé en dur.
+        self.assertEqual(out['renvois'],[])
+        self.assertEqual(out['comptes']['alerte'],0)
+        self.assertTrue(any('84-53' in x for x in out['mentionsNonResolues']))
         self.assertEqual([x['id'] for x in out['liensIndexationSeule']],[MINING])
-        self.assertEqual(out['renvois'][0]['suggestion']['id'],NEW)
-        self.assertIn('status-alerte',out['sourceHtmlAnnote'])
+        self.assertIn('status-nonresolu',out['sourceHtmlAnnote'])
         self.assertNotIn(MINING,out['sourceHtmlAnnote'])
     def test_no_api_return_stays_unknown_with_documented_fix(self):
         out=server.analyze(Fake(False),SRC,DAY)
         self.assertEqual(out['renvois'],[])
         self.assertTrue(any('84-53' in x for x in out['mentionsNonResolues']))
         self.assertIn('status-nonresolu',out['sourceHtmlAnnote'])
-        self.assertEqual(len(out['correctionsDocumentees']),1)
-        self.assertIn('332-23',out['correctionsDocumentees'][0]['referenceRecommandee'])
+        self.assertEqual(out['correctionsDocumentees'],[])
         self.assertEqual(out['comptes']['alerte'],0)
     def test_index_without_body_is_not_colored(self):
         markup,n,refs=server.render_annotated_html({'texteHtml':'<p>Pas de référence.</p>'},[{'id':MINING,'titre':'Code minier - art. L611-31','statut':'alerte'}])

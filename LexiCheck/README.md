@@ -1,45 +1,41 @@
-# LexiCheck v3.6 — cohérence texte / résultats
+# LexiCheck v3.7 — suggestions génériques, sans correctifs par article
 
-Cette version corrige deux problèmes identifiés sur l'article L. 4141-2 du CGCT :
+Cette version remplace le moteur de proposition de corrections. **Aucun article, texte ou identifiant de remplacement n'est codé en dur.** Une proposition doit être justifiée par les liens de concordance effectivement retournés par l'API officielle Légifrance.
 
-1. Les références vers une **loi non codifiée**, comme « l'article 3 de la loi n° 84-53 », peuvent être réparties entre plusieurs balises HTML (`span`, `strong`, liens). Elles sont désormais reconnues et annotées dans le flux textuel entier, même si l'API ne parvient pas à retrouver leur article cible. Dans ce dernier cas, la référence reste **violette**, et une correction explicitement documentée par le Sénat est signalée comme telle, **sans prétendre être une concordance API**.
-2. Un lien présent dans les **métadonnées d'indexation** ne prouve pas qu'il est cité dans la rédaction. Les liens non retrouvés dans le texte sont désormais affichés séparément, dans un panneau replié, et **ne sont plus comptés dans les statistiques de renvois du texte**, y compris en analyse par lots.
+## Fonctionnement
 
-### Article 3 de la loi de 1984
+1. LexiCheck extrait les mentions de l'article source : liens HTML, références en texte brut et plages d'articles ; pour les textes non codifiés, il tente d'identifier la loi, le décret ou l'ordonnance par son numéro.
+2. Il vérifie si l'article cité est toujours en vigueur, ou s'il existe une version actuelle du **même article** (même CID). Le simple changement de version `LEGIARTI` ne justifie pas une correction de référence.
+3. Pour un article réellement abrogé, remplacé ou indéterminé, il interroge **`/consult/concordanceLinksArticle`** sur sa version citée puis sur plusieurs versions historiques du même CID (lorsqu'elles sont connues).
+4. Il suit, si nécessaire, une chaîne de concordances entre articles historiques jusqu'à un article en vigueur. Les chemins et articles trouvés sont dédupliqués par CID juridique et conservés comme provenance.
+5. **Un seul successeur actuel** et un texte intégral rigoureusement identique (après suppression du HTML/espaces redondants) : « Correction proposée · rédaction identique ». Rédactions différentes : « Correction à vérifier ». Plusieurs successeurs, erreurs d'API ou recherche incomplète : **aucun remplacement automatique**.
+6. Les renvois réellement présents dans la rédaction restent distincts des liens seulement indexés. Les références impossibles à résoudre restent violettes.
 
-La recherche classique dans LODA est conservée. Si elle échoue pour l'article 3 de la loi n° 84-53, le serveur tente une consultation directe de l'identifiant historique connu `LEGIARTI000038922660`. Il ne le retient **que si l'API confirme le numéro de l'article et le titre de la loi**. En cas d'échec, l'article reste « non résolu » et seule la suggestion documentaire du Sénat est affichée : remplacement par « I de l'article L. 332-23 du Code général de la fonction publique ». Source : https://www.senat.fr/rap/l23-260/l23-2604.html
+### Limites techniques et juridiques
 
-### Autres améliorations
+- L'API **n'offre pas de table de concordance universelle, garantie exhaustive**. Si elle ne renvoie pas de successeur, LexiCheck indique qu'aucun successeur n'a été **confirmé** ; il n'invente pas de correction. L'article 3 de la loi n° 84-53 vers l'article L. 332-23 du CGFP *ne sera donc proposé que si les données API permettent réellement d'établir cette concordance*. La proposition précédemment injectée à la main a été supprimée.
+- Recherche des concordances volontairement **bornée** pour préserver les quotas PISTE (par défaut 9 appels et 3 niveaux de chaîne par référence, 5 versions initiales). Une recherche limitée ou interrompue est signalée comme partielle et ne donne pas de correction certaine. Paramètres : `CONCORDANCE_MAX_CALLS`, `CONCORDANCE_MAX_HOPS`, `CONCORDANCE_VERSION_PROBES`.
+- La recherche historique des lois non codifiées utilise désormais `LODA_ETAT` et un échantillonnage de dates **générique** (sans date de réforme privilégiée). Elle n'est pas exhaustive, notamment sur les lois très anciennes ; aucun numéro n'est associé à un texte différent sans vérification du titre du texte et de l'article.
+- Une identité textuelle **n'établit pas** une équivalence de portée juridique. Les corrections proposées doivent être vérifiées avant application.
 
-- Les plages comme `L. 212-34 à L. 212-36` conservent leur vérification article par article, même si un hyperlien couvre toute la plage.
-- Les références figurant dans plusieurs éléments HTML inline sont repérées sans supprimer les paragraphes ni la mise en forme du texte.
-- La version `3.6.0` apparaît dans l'en-tête et dans `/api/health`, ainsi que dans le résultat de l'analyse, afin de diagnostiquer un déploiement non actualisé sur Render.
-- Les fichiers CSS et JS portent un numéro de version dans leur URL, afin d'éviter un décalage entre l'ancien frontend et le nouveau serveur.
+## Installation sur Render
 
-### Déploiement Render
-
-Dans le dépôt GitHub déjà connecté à Render, remplacer **les quatre fichiers** :
+Remplacer dans le dépôt GitHub :
 
 - `server.py`
 - `static/app.js`
 - `static/index.html`
-- `static/style.css`
 
-Conserver les autres fichiers (dont les mentions légales) et les variables d'environnement déjà configurées. Commit puis attendre la fin du déploiement. Vérifier le champ `version` à `https://VOTRE-SITE.onrender.com/api/health` : il doit valoir `3.6.0`. Actualiser ensuite la page et vérifier que l'en-tête indique `v3.6.0`.
+Conserver `static/style.css`, `static/mentions-legales.html`, les identifiants OAuth PISTE et les autres fichiers. Render : **Build Command** `echo "No dependencies"` et **Start Command** `python server.py` ; `HOST=0.0.0.0`.
 
-Configuration Render inchangée :
+Après déploiement, `https://votre-app.onrender.com/api/health` doit contenir `"version": "3.7.0"` ; actualiser le navigateur avec `Ctrl + F5`.
 
-- Build : `echo "No dependencies"`
-- Start : `python server.py`
-
-### Tests
+## Tests locaux
 
 ```bash
 python -m unittest discover -s tests -q
 ```
 
-49 tests locaux réussis au moment de l'export, dont 5 nouveaux tests reproduisant : extraction à travers plusieurs balises HTML, résolution par article historique après échec de `/search`, conservation d'un statut indéterminé si l'API ne confirme pas l'article, séparation des liens indexés, et assainissement du HTML.
+Les tests utilisent des réponses PISTE **simulées**, sans aucune clé réelle. Ils couvrent notamment les concordances simples, les chaînes de transferts, l'historique d'un même CID, l'ambiguïté, les références non résolues et l'absence de correspondance. **Les appels effectifs à PISTE restent à valider sur l'instance déployée.**
 
-### Limite importante
-
-Les appels PISTE n'ont **pas** été testés ici avec des identifiants réels. L'API peut renvoyer des champs différents des réponses simulées. Une correspondance documentaire ou lexicale ne constitue jamais une validation juridique de la substitution proposée.
+API officielle : https://www.legifrance.gouv.fr/contenu/pied-de-page/foire-aux-questions-api

@@ -60,7 +60,7 @@ class RenvoisTests(unittest.TestCase):
         self.assertEqual(r['versionActuelle']['id'],A)
 
     def test_abrogation_with_concordance(self):
-        c=FakeClient({B:{'id':B,'cid':C,'etat':'ABROGE','dateDebut':'2000-01-01','dateFin':'2018-01-01'}},
+        c=FakeClient({B:{'id':B,'cid':C,'etat':'ABROGE','dateDebut':'2000-01-01','dateFin':'2018-01-01'}, A:{'id':A,'cid':A,'etat':'VIGUEUR','dateDebut':'2018-01-01','dateFin':'2999-01-01','texteHtml':'<p>nouveau</p>'}},
                      concordance={B:{'newTexts':[{'id':A,'name':'Article A','modifications':[{'type':'TRANSFERT'}]}]}})
         r=server.inspect_reference(c,{'id':B,'titre':'B','sources':['indexation']},self.day)
         self.assertEqual(r['statut'],'alerte')

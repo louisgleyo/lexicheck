@@ -32,6 +32,7 @@ class FakeClient:
         if endpoint=='search':
             q=data['recherche'];assert [x['typeChamp'] for x in q['champs']]==['NUM','NUM_ARTICLE']
             assert [x['criteres'][0]['valeur'] for x in q['champs']]==['84-53','3']
+            if data['fond']=='LODA_ETAT':return {'results':[]}
             assert data['fond']=='LODA_DATE'
             if not q['filtres']:return {'results':[]}
             date_ms=q['filtres'][0]['singleDate'];day=dt.datetime.fromtimestamp(date_ms/1000, tz=dt.timezone.utc).date()
@@ -52,16 +53,15 @@ class LawReferenceTests(unittest.TestCase):
         count=len(c.calls)
         c.search_loda_article_number('3','84-53',DAY)
         self.assertEqual(len(c.calls),count)
-    def test_integrated_detection_and_senate_fix(self):
+    def test_integrated_detection_without_curated_fix(self):
         c=FakeClient();r=server.analyze(c,SOURCE,DAY)
         matching=[x for x in r['renvois'] if x.get('texteNumero')=='84-53']
         self.assertEqual(len(matching),1)
         x=matching[0]
         self.assertEqual(x['statut'],'alerte')
         self.assertEqual(x['nature'],'LODA')
-        self.assertEqual(x['suggestion']['statut'],'verification')
-        self.assertEqual(x['suggestion']['id'],NEW)
-        self.assertIn('senat.fr',x['suggestion']['sourceDocumentaire'])
+        self.assertEqual(x['suggestion']['statut'],'aucune')
+        self.assertNotIn('id',x['suggestion'])
         self.assertIn('status-alerte',r['sourceHtmlAnnote'])
         self.assertIn("l&#x27;article 3 de la loi n° 84-53", r['sourceHtmlAnnote'])
         self.assertEqual(r['mentionsNonResolues'],[])
