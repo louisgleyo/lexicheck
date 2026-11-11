@@ -1,178 +1,54 @@
 'use strict';
-const $ = (id) => document.getElementById(id);
-let data = null;
-let currentFilter = 'tous';
-const statusNames = {vigoureux: 'En vigueur', alerte: 'Alerte potentielle', ancienne_version: 'Ancienne version', indetermine: 'Indéterminé'};
-const statuses = ['alerte','indetermine','ancienne_version','vigoureux'];
+const $ = id => document.getElementById(id);
+let kind = 'article';
+let outline = null;
+let selectedOutline = null;
+let rows = [];
+let singleDetail = null;
+let activeFilter = 'issues';
+let offset = 0;
+let stopped = false;
+let running = false;
+let currentScope = '';
 
-function text(node, value) { node.textContent = String(value ?? ''); }
-function make(tag, attrs = {}, content = null) {
-  const el = document.createElement(tag);
-  for (const [k,v] of Object.entries(attrs)) {
-    if (k === 'class') el.className = v;
-    else if (k === 'href') el.href = v;
-    else if (k === 'target') el.target = v;
-    else el.setAttribute(k, v);
-  }
-  if (content !== null) text(el, content);
-  return el;
-}
-function officialUrl(id, nature='') {
-  if (/^JORFARTI\d{12}$/.test(id)) return `https://www.legifrance.gouv.fr/jorf/id/${id}`;
-  if (/^LEGIARTI\d{12}$/.test(id)) {
-    return `https://www.legifrance.gouv.fr/${nature === 'CODE' ? 'codes' : 'loda'}/article_lc/${id}`;
-  }
-  return 'https://www.legifrance.gouv.fr/';
-}
-function friendlyDate(iso) {
-  if (!iso) return '—';
-  const d = new Date(String(iso).slice(0,10) + 'T12:00:00Z');
-  if (Number.isNaN(d.valueOf())) return '—';
-  return new Intl.DateTimeFormat('fr-FR',{day:'2-digit',month:'short',year:'numeric',timeZone:'UTC'}).format(d);
-}
-function showError(message) { const el = $('error-box'); text(el, message); el.classList.remove('hidden'); }
-function clearError() { $('error-box').classList.add('hidden'); }
-async function health() {
-  try {
-    const resp = await fetch('/api/health');
-    const obj = await resp.json();
-    const indicator = $('connection');
-    indicator.className = 'connection ' + (obj.configured ? 'is-good' : 'is-bad');
-    text(indicator, obj.configured ? `PISTE · ${obj.environment === 'sandbox' ? 'Sandbox' : 'Production'} configuré` : 'Identifiants PISTE à configurer');
-    indicator.prepend(make('i'));
-  } catch {
-    text($('connection'), 'Connexion serveur indisponible');
-  }
-}
-function setLoading(on) {
-  $('loading').classList.toggle('hidden',!on);
-  $('analyze-button').disabled=on;
-  text($('button-label'),on ? 'Analyse en cours…' : 'Analyser les renvois');
-}
-async function submitArticle(value) {
-  clearError();
-  const input = value.trim();
-  if (!/LEGIARTI\d{12}/i.test(input)) return showError("Veuillez saisir un identifiant LEGIARTI valide ou une URL Légifrance contenant cet identifiant.");
-  setLoading(true);
-  try {
-    const resp = await fetch('/api/analyze', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({article:input,mode:document.querySelector('input[name="mode"]:checked')?.value||'actuel'})});
-    const obj = await resp.json();
-    if (!resp.ok) throw new Error(obj.erreur || 'Erreur de communication avec le serveur.');
-    data = obj;
-    currentFilter = 'tous';
-    $('filter-text').value='';
-    $('filter-text').disabled=false;
-    document.querySelectorAll('.filter').forEach(x=>x.classList.toggle('active',x.dataset.filter==='tous'));
-    render();
-  } catch(err) {showError(err.message || String(err));}
-  finally{setLoading(false);}
-}
-function render() {
-  if(!data)return;
-  const c = data.comptes;
-  text($('date-pill'),`Vérification · ${friendlyDate(data.dateAnalyse)} · ${data.mode==='actuel'?'Version en vigueur':'Version fournie'}`);
-  text($('stat-total'),data.renvois.length);
-  text($('stat-alertes'),c.alerte);
-  text($('stat-versions'),c.ancienne_version);
-  text($('stat-valides'),c.vigoureux);
-  text($('result-count'),`(${data.renvois.length})`);
-  $('export-button').disabled=false;
-  const src = $('source-card'); src.replaceChildren();
-  src.append(make('div',{class:'source-name'},data.article.titre || 'Article analysé'));
-  src.append(make('div',{class:'source-id'},data.article.id));
-  const tags = make('div',{class:'source-meta'});
-  tags.append(make('span',{class:'micro-tag'},data.article.etat || 'État inconnu'));
-  tags.append(make('span',{class:'micro-tag'},'N° ' + (data.article.numero || 'non renseigné')));
-  src.append(tags);
-  const versionLabel = data.mode==='actuel' ? 'Version en vigueur à la date du contrôle' : 'Version historique fournie';
-  src.append(make('div',{class:'source-note'},versionLabel));
-  if(data.versionChangee) src.append(make('p',{class:'source-switch-note'},`Version de l'URL : ${data.articleDemandee?.id} → version analysée : ${data.article.id}`));
-  const srcLink = make('a',{class:'source-link',href:officialUrl(data.article.id,data.sourceNature||'CODE'),target:'_blank',rel:'noopener noreferrer'},'Consulter sur Légifrance ↗');src.append(srcLink);
-  renderDocument();
-  const issues = [...(data.avertissements||[])];
-  if((data.mentionsNonResolues||[]).length)issues.push(`${data.mentionsNonResolues.length} mention(s) de type « article L. 123-1 » sans identifiant résolu, potentiellement à vérifier manuellement : ${data.mentionsNonResolues.slice(0,7).join(' ; ')}${data.mentionsNonResolues.length>7?'…':''}`);
-  $('warnings-card').classList.toggle('hidden',issues.length===0);
-  $('warnings-list').replaceChildren(...issues.map(x=>make('p',{},x)));
-  renderResults();
-  if(data.renvois.length) document.querySelector('.workspace').scrollIntoView({behavior:'smooth',block:'start'});
-}
-function renderDocument() {
-  if (!data) return;
-  const a = data.article;
-  text($('document-parent'), a.titre || 'Texte consolidé');
-  text($('document-heading'),`Article ${a.numero || 'sans numéro'}`);
-  let dates = a.dateDebut ? `Version du ${friendlyDate(a.dateDebut)}` : 'Version sélectionnée';
-  if (a.dateFin && !String(a.dateFin).startsWith('2999')) dates += ` au ${friendlyDate(a.dateFin)}`;
-  else dates += ' · En vigueur à la date du contrôle';
-  text($('document-dates'),dates);
-  const link=$('document-link'); link.href=officialUrl(a.id,data.sourceNature||'CODE'); link.hidden=false;
-  const banner=$('version-banner');
-  banner.classList.toggle('hidden',!data.versionChangee && data.mode!=='historique');
-  if(data.versionChangee) text(banner,`Version ancienne détectée (${data.articleDemandee?.id}). La rédaction affichée est celle en vigueur aujourd'hui (${a.id}).`);
-  else if(data.mode==='historique') text(banner,`Mode historique : vous examinez précisément la version ${a.id} fournie. Les statuts des renvois sont évalués aujourd'hui.`);
-  const body=$('document-body');
-  // HTML autorisé et échappé côté serveur par SafeArticleRenderer (aucun HTML PISTE brut).
-  body.innerHTML = data.sourceHtmlAnnote || '<p class="document-placeholder">Le contenu HTML de cet article n’est pas disponible via l’API.</p>';
-  text($('text-explanation'),`${data.renvoisSurlignes || 0} occurrence(s) de liens analysés surlignée(s). Cliquez sur une référence pour la consulter sur Légifrance.`);
-}
-
-function renderResults() {
-  if(!data)return;
-  const query = $('filter-text').value.trim().toLocaleLowerCase('fr');
-  const rows = data.renvois.filter(r=>(currentFilter==='tous'||r.statut===currentFilter)&&(!query||`${r.id} ${r.titre} ${r.raison} ${r.evidence}`.toLocaleLowerCase('fr').includes(query)));
-  const list=$('results-list'); list.replaceChildren();
-  if(!rows.length){list.append(make('div',{class:'empty-state'},'Aucun renvoi ne correspond à ce filtre.'));return;}
-  for(const r of rows){
-    const wrap=make('article',{class:'result-item',id:`reference-${r.id}`});
-    const top=make('div',{class:'result-row'});
-    const left=make('div');
-    left.append(make('div',{class:'result-title'},r.titre || r.id));
-    left.append(make('div',{class:'result-id'},r.id));
-    top.append(left,make('span',{class:'status-pill '+r.statut},statusNames[r.statut]||r.statut));
-    wrap.append(top);
-    wrap.append(make('p',{class:'result-reason'},r.raison||''));
-    const tags=make('div',{class:'result-tags'});
-    if(r.etat)tags.append(make('span',{class:'micro-tag'},'État API : '+r.etat));
-    if(r.dateFin)tags.append(make('span',{class:'micro-tag'},'Fin de version : '+friendlyDate(r.dateFin)));
-    if(r.sources?.includes('texte'))tags.append(make('span',{class:'micro-tag'},'Dans le texte HTML'));
-    if(r.sources?.includes('indexation'))tags.append(make('span',{class:'micro-tag'},'Indexation Légifrance'));
-    wrap.append(tags);
-    if(r.versionActuelle?.id && r.versionActuelle.id!==r.id){
-      const concord=make('div',{class:'concordance'});
-      concord.append(make('strong',{},'Version actuellement en vigueur identifiée'));
-      const a=make('a',{href:officialUrl(r.versionActuelle.id,r.nature),target:'_blank',rel:'noopener noreferrer'},r.versionActuelle.id+' ↗');concord.append(a);
-      wrap.append(concord);
-    }
-    if(r.concordances?.length){
-      const concord=make('div',{class:'concordance'});
-      concord.append(make('strong',{},'Concordances possibles · ne constituent pas une validation juridique'));
-      r.concordances.forEach(x=>concord.append(make('a',{href:officialUrl(x.id,r.nature),target:'_blank',rel:'noopener noreferrer'},`${x.titre || x.id} ${x.type ? '· '+x.type : ''} ↗`)));
-      wrap.append(concord);
-    }
-    const bottom=make('div',{class:'result-bottom'});
-    bottom.append(make('span',{class:'result-id'},r.evidence || 'Référence recensée'));
-    bottom.append(make('a',{href:officialUrl(r.id,r.nature),target:'_blank',rel:'noopener noreferrer'},'Voir l’article source ↗'));
-    wrap.append(bottom);
-    list.append(wrap);
-  }
-}
-function exportCsv() {
-  if(!data)return;
-  const headers=['id_saisi','id_source_analyse','mode','id_cible','titre_cible','statut','etat_API','date_debut','date_fin','sources','motif','version_actuelle','concordances_possibles'];
-  const escapeCSV=v=>'"'+String(v??'').replace(/"/g,'""')+'"';
-  const lines=[headers.join(';')];
-  for(const r of data.renvois){
-    const vals=[data.articleDemandee?.id||data.article.id,data.article.id,data.mode,r.id,r.titre,r.statut,r.etat,r.dateDebut,r.dateFin,(r.sources||[]).join('|'),r.raison,r.versionActuelle?.id||'',(r.concordances||[]).map(x=>x.id).join('|')];
-    lines.push(vals.map(escapeCSV).join(';'));
-  }
-  const blob=new Blob(['\ufeff'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'});
-  const url=URL.createObjectURL(blob);
-  const a=make('a',{href:url,download:`renvois_${data.article.id}_${data.dateAnalyse}.csv`});
-  document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
-}
-$('analyze-form').addEventListener('submit',ev=>{ev.preventDefault();submitArticle($('article-input').value);});
-$('sample').addEventListener('click',()=>{$('article-input').value='LEGIARTI000006307920';$('article-input').focus();});
-$('export-button').addEventListener('click',exportCsv);
-$('filter-text').addEventListener('input',renderResults);
-$('filters').addEventListener('click',ev=>{const button=ev.target.closest('button[data-filter]');if(!button)return;currentFilter=button.dataset.filter;document.querySelectorAll('.filter').forEach(x=>x.classList.toggle('active',x===button));renderResults();});
-health();
+const names = {vigoureux:'En vigueur',alerte:'À vérifier',ancienne_version:'Version antérieure',indetermine:'Indéterminé'};
+function el(tag, cls='', value=null){const n=document.createElement(tag);if(cls)n.className=cls;if(value!==null)n.textContent=String(value);return n}
+function setText(id,value){$(id).textContent=String(value??'')}
+function hide(id,yes=true){$(id).classList.toggle('hidden',yes)}
+function error(message){setText('error',message);hide('error',false)}
+function clearError(){hide('error')}
+function niceDate(v){if(!v)return '';const d=new Date(String(v).slice(0,10)+'T12:00:00Z');return Number.isNaN(+d)?'':new Intl.DateTimeFormat('fr-FR',{dateStyle:'long',timeZone:'UTC'}).format(d)}
+function official(id,kind='CODE'){if(/^LEGIARTI\d{12}$/.test(id))return `https://www.legifrance.gouv.fr/${kind==='CODE'?'codes':'loda'}/article_lc/${id}`;return 'https://www.legifrance.gouv.fr/'}
+function authHeaders(){return {'X-LexiCheck-Access':$('app-password').value||''}}
+async function post(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json',...authHeaders()},body:JSON.stringify(body)});let d;try{d=await r.json()}catch{throw Error('Réponse serveur illisible.')}if(!r.ok)throw Error(d.erreur||`Erreur HTTP ${r.status}`);return d}
+function setBusy(yes){$('primary-btn').disabled=yes;setText('primary-btn',yes?'Chargement…':kind==='article'?'Analyser →':'Charger le sommaire →')}
+async function checkHealth(){try{const d=await(await fetch('/api/health')).json();setText('connection',d.configured?'API PISTE configurée':'Identifiants PISTE manquants');hide('password-option',!d.protected)}catch{setText('connection','Serveur indisponible')}}
+function reset(){outline=null;selectedOutline=null;rows=[];singleDetail=null;offset=0;stopped=true;running=false;hide('outline-panel');hide('progress-panel');hide('results');hide('reader');clearError()}
+function changeKind(value){kind=value;document.querySelectorAll('.scope').forEach(b=>b.classList.toggle('active',b.dataset.kind===value));reset();setText('url-label',value==='article'?"Lien ou identifiant de l'article":value==='section'?'Lien Légifrance d’un titre ou d’une section':'Lien Légifrance du code');$('url-input').placeholder=value==='article'?'https://www.legifrance.gouv.fr/codes/article_lc/LEGIARTI…':value==='section'?'https://www.legifrance.gouv.fr/codes/section_lc/LEGITEXT…/LEGISCTA…':'https://www.legifrance.gouv.fr/codes/texte_lc/LEGITEXT…';hide('history-option',value!=='article');setText('input-help',value==='article'?'La version en vigueur est analysée par défaut.':'Données à la date du jour. Les codes sont parcourus par lots.');setBusy(false)}
+function summaryFor(detail){return {id:detail.article.id,titre:detail.article.titre,numero:detail.article.numero,comptes:detail.comptes,totalIdentifies:detail.totalIdentifies,limite:detail.limite,renvois:detail.renvois.filter(r=>r.statut!=='vigoureux'),avertissements:detail.avertissements}}
+async function loadSingle(value){setBusy(true);try{const d=await post('/api/analyze',{article:value,mode:$('historical').checked?'historique':'actuel'});singleDetail=d;rows=[summaryFor(d)];currentScope='Un article';hide('results',false);renderRows();renderDetail(d);$('results').scrollIntoView({behavior:'smooth',block:'start'})}catch(e){error(e.message)}finally{setBusy(false)}}
+function populateSections(data){const sel=$('section-select');sel.replaceChildren();const defaultOp=el('option','',data.type==='section'?'Section sélectionnée':'Code entier');defaultOp.value='';sel.append(defaultOp);const options=(data.sections||[]).filter(s=>/^LEGISCTA\d{12}$/.test(s.id));for(const s of options){const op=el('option','',`${'· '.repeat(Math.min(s.niveau,5))}${s.titre}`);op.value=s.id;sel.append(op)}$('section-select').disabled=data.type==='section'}
+async function loadOutline(value,type){setBusy(true);try{const d=await post('/api/outline',{value,type});outline=d;selectedOutline=d;populateSections(d);setText('outline-title',d.titre || 'Code');setText('outline-info',`${d.nombre.toLocaleString('fr-FR')} articles identifiés dans le sommaire · ${niceDate(d.date)}`);hide('outline-panel',false);$('outline-panel').scrollIntoView({behavior:'smooth',block:'nearest'})}catch(e){error(e.message)}finally{setBusy(false)}}
+async function selectSection(){const id=$('section-select').value;if(!id){selectedOutline=outline;setText('outline-info',`${outline.nombre.toLocaleString('fr-FR')} articles identifiés dans le sommaire · ${niceDate(outline.date)}`);return}try{const d=await post('/api/outline',{value:`${outline.textId}/${id}`,type:'section'});selectedOutline=d;setText('outline-info',`${d.nombre.toLocaleString('fr-FR')} articles dans la partie choisie · ${niceDate(d.date)}`)}catch(e){error(e.message)}}
+function progress(message,done,total){hide('progress-panel',false);setText('progress-message',message);setText('progress-counter',`${done.toLocaleString('fr-FR')} / ${total.toLocaleString('fr-FR')}`);$('progress-bar').style.width=total?`${Math.round(100*done/total)}%`:'0%'}
+function pause(){stopped=true;$('auto-next').checked=false;setText('pause-btn','Analyse suspendue après ce lot')}
+function mergeJob(job){for(const r of job.resultats||[])if(!rows.some(x=>x.id===r.id))rows.push(r);if(job.erreurs?.length){const first=job.erreurs[0];error(`${job.erreurs.length} article(s) non vérifié(s) dans ce lot. Exemple : ${first.id} · ${first.erreur}. Analyse interrompue pour éviter un résultat trompeur.`);stopped=true}}
+async function runBatch(){if(running||!selectedOutline)return;const ids=selectedOutline.articles.map(a=>a.id);if(offset>=ids.length)return;running=true;hide('continue-btn',true);hide('results',false);progress('Lancement du lot…',offset,ids.length);try{const size=Number($('batch-size').value)||25;const first=await post('/api/jobs',{ids,offset,count:size});let j=first;while(!j.termine){await new Promise(r=>setTimeout(r,1700));const response=await fetch(`/api/jobs/${encodeURIComponent(first.jobId)}`,{headers:authHeaders()});j=await response.json();if(!response.ok)throw Error(j.erreur||'Suivi du lot perdu.');progress(`Analyse en cours : ${j.traites}/${j.totalLot} dans ce lot`,j.offset+j.traites,j.totalScope)}mergeJob(j);offset=j.nextOffset;renderRows();progress(offset>=ids.length?'Analyse terminée':stopped?'En pause — lot terminé':'Lot terminé',offset,ids.length);if(offset>=ids.length)hide('continue-btn',true);else hide('continue-btn',false)}catch(e){error(e.message);stopped=true}finally{running=false}if(offset<ids.length&&!stopped&&$('auto-next').checked)runBatch()}
+function startBulk(){if(!selectedOutline)return;rows=[];offset=0;stopped=!$('auto-next').checked;currentScope=`${selectedOutline.titre} · ${selectedOutline.nombre} articles`;hide('reader');clearError();runBatch()}
+function statusRow(r){const c=r.comptes||{};if(c.alerte)return ['alerte',`${c.alerte} alerte${c.alerte>1?'s':''}`];if(c.indetermine)return ['indetermine',`${c.indetermine} indéterminé${c.indetermine>1?'s':''}`];if(c.ancienne_version)return ['ancienne_version',`${c.ancienne_version} ancienne${c.ancienne_version>1?'s':''} version${c.ancienne_version>1?'s':''}`];if(r.avertissements?.some(a=>/partiel|premiers renvois/i.test(a)))return ['indetermine','Contrôle partiel'];return ['vigoureux','Pas d’alerte détectée']}
+function renderRows(){const total=rows.length;const sum={alerte:0,ancienne_version:0,indetermine:0,vigoureux:0,suggestions:0,partiels:0};for(const r of rows){for(const k of ['alerte','ancienne_version','indetermine','vigoureux'])sum[k]+=r.comptes?.[k]||0;sum.suggestions+=(r.renvois||[]).filter(x=>x.suggestion?.statut==='proposition').length;if(r.totalIdentifies>r.limite)sum.partiels++}const box=$('summary');box.replaceChildren();for(const [num,label] of [[total,'articles examinés'],[sum.alerte,'renvois à vérifier'],[sum.suggestions,'corrections proposées'],[sum.ancienne_version,'anciennes versions']]){const item=el('div','summary-block');item.append(el('strong','',num),el('span','',label));box.append(item)}setText('result-subtitle',`${currentScope}${sum.partiels?' · '+sum.partiels+' articles partiellement vérifiés':''}`);const query=$('search-filter').value.toLowerCase().trim();const selected=rows.filter(r=>{const status=statusRow(r)[0];if(activeFilter==='issues'&&status==='vigoureux')return false;if(activeFilter==='ok'&&status!=='vigoureux')return false;if(query&&!`${r.id} ${r.titre} ${r.numero} ${(r.renvois||[]).map(x=>x.titre).join(' ')}`.toLowerCase().includes(query))return false;return true});const list=$('items');list.replaceChildren();if(!selected.length){list.append(el('div','empty',total?'Aucun résultat pour ce filtre.':'Les résultats des articles analysés apparaîtront ici.'));return}for(const r of selected.slice(0,500)){const item=el('div','item');const main=el('div','item-main');const b=el('button','item-title',`Article ${r.numero || r.id}`);b.type='button';b.addEventListener('click',()=>openArticle(r.id));main.append(b);main.append(el('div','item-sub',`${r.id}${r.totalIdentifies>r.limite?' · renvois partiellement examinés':''}`));const status=statusRow(r);const action=el('div','item-actions');action.append(el('span',`status ${status[0]}`,status[1]));const a=el('a','','↗');a.href=official(r.id);a.target='_blank';a.rel='noopener noreferrer';a.title='Voir sur Légifrance';action.append(a);item.append(main,action);list.append(item)}if(selected.length>500)list.append(el('div','empty',`Affichage limité aux 500 premiers résultats sur ${selected.length}. Utilisez le filtre ou l'export CSV.`))}
+async function openArticle(id){try{let d;if(singleDetail?.article?.id===id)d=singleDetail;else d=await post('/api/analyze',{article:id,mode:'actuel'});renderDetail(d);$('reader').scrollIntoView({behavior:'smooth',block:'start'})}catch(e){error(e.message)}}
+function renderDetail(d){hide('reader',false);setText('reader-title',`Article ${d.article.numero||''}`);setText('reader-dates',`${d.article.titre||''} · version du ${niceDate(d.article.dateDebut)}`);$('reader-link').href=official(d.article.id,d.sourceNature);hide('version-note',!d.versionChangee&&!d.avertissements?.length);setText('version-note',[...(d.versionChangee?[`Version de l'URL remplacée par la rédaction actuelle (${d.article.id}).`]:[]),...(d.avertissements||[])].join(' '));
+  // HTML reconstruit et nettoyé côté serveur, jamais fourni librement par l'utilisateur.
+  $('article-text').innerHTML=d.sourceHtmlAnnote||'<p>Texte indisponible via l’API.</p>';const list=$('reference-list');list.replaceChildren();if(!d.renvois?.length){list.append(el('p','muted','Aucun renvoi résolu automatiquement.'));return}for(const r of d.renvois){const box=el('div','ref-row');const heading=el('div','ref-heading');const a=el('a','',r.titre||r.numero||r.id);a.href=official(r.id,r.nature);a.target='_blank';a.rel='noopener noreferrer';heading.append(a,el('span',`status ${r.statut}`,names[r.statut]||r.statut));box.append(heading,el('p','ref-reason',r.raison||''));const s=r.suggestion;if(s&&s.statut!=='aucune'){const correction=el('div','correction');correction.append(el('strong','',s.libelle||'Concordance'));if(s.id){const dest=el('a','',`Article proposé : ${s.id} ↗`);dest.href=official(s.id,r.nature);dest.target='_blank';dest.rel='noopener noreferrer';correction.append(dest)}const c=(s.candidats||[]).find(x=>x.id===s.id);if(c&&c.similarite!==null)correction.append(el('div','source-fineprint',`Similarité textuelle indicative : ${c.similarite} %. Une comparaison identique ne constitue pas une validation juridique.`));if(c&&(c.extraitAncien||c.extraitNouveau)){const comp=el('div','comparison');const x=el('div');x.append(el('b','','Ancienne rédaction'),el('span','',c.extraitAncien||'Texte indisponible'));const y=el('div');y.append(el('b','','Nouvelle rédaction'),el('span','',c.extraitNouveau||'Texte indisponible'));comp.append(x,y);correction.append(comp)}box.append(correction)}list.append(box)}list.append(el('p','source-fineprint',`${d.renvoisSurlignes||0} occurrences surlignées dans la rédaction. Un renvoi abrogé n'est pas nécessairement une erreur.`))}
+function exportCsv(){if(!rows.length)return;const cols=['article','numero','cible','statut','etat','date_fin','suggestion','cible_proposee','redaction_identique','similarite'];const quote=x=>'"'+String(x??'').replace(/"/g,'""')+'"';const lines=[cols.join(';')];for(const r of rows){if(!(r.renvois||[]).length){lines.push([r.id,r.numero,'','','','','','','',''].map(quote).join(';'));continue}for(const x of r.renvois){const c=(x.suggestion?.candidats||[]).find(v=>v.id===x.suggestion.id);lines.push([r.id,r.numero,x.id,x.statut,x.etat,x.dateFin,x.suggestion?.statut,x.suggestion?.id,c?.identique??'',c?.similarite??''].map(quote).join(';'))}}const blob=new Blob(['\ufeff'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'});const u=URL.createObjectURL(blob);const a=el('a');a.href=u;a.download='lexicheck-audit.csv';a.click();setTimeout(()=>URL.revokeObjectURL(u),1500)}
+document.querySelectorAll('.scope').forEach(b=>b.addEventListener('click',()=>changeKind(b.dataset.kind)));
+$('form').addEventListener('submit',e=>{e.preventDefault();clearError();const value=$('url-input').value.trim();if(kind==='article'){if(!/LEGIARTI\d{12}/i.test(value)){error('Saisissez une URL ou un identifiant LEGIARTI.');return}loadSingle(value)}else{if(!/LEGITEXT\d{12}/i.test(value)){error('Saisissez l’URL d’un code contenant LEGITEXT.');return}if(kind==='section'&&!/LEGISCTA\d{12}/i.test(value)){error('L’URL d’un titre ou d’une section doit contenir LEGITEXT et LEGISCTA.');return}loadOutline(value,kind)}});
+$('section-select').addEventListener('change',selectSection);
+$('launch-bulk').addEventListener('click',startBulk);
+$('pause-btn').addEventListener('click',pause);
+$('continue-btn').addEventListener('click',()=>{stopped=false;runBatch()});
+$('export-btn').addEventListener('click',exportCsv);
+$('search-filter').addEventListener('input',renderRows);
+document.querySelectorAll('.filter').forEach(b=>b.addEventListener('click',()=>{activeFilter=b.dataset.filter;document.querySelectorAll('.filter').forEach(x=>x.classList.toggle('is-active',x===b));renderRows()}));
+checkHealth();

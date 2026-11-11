@@ -1,95 +1,67 @@
-# LexiCheck v2 — version en vigueur et lecture annotée des renvois
+# LexiCheck v3 — Audit des renvois Légifrance
 
-Application web **une page** et serveur Python local. Elle appelle **réellement l'API officielle Légifrance via PISTE** pour un identifiant `LEGIARTI` donné.
+Application web légère en **Python standard (sans `requirements.txt`)**. Les requêtes OAuth vers PISTE sont effectuées par le serveur, jamais par le navigateur.
 
-## Ce qu'elle fait
+## Nouvelles fonctionnalités
 
-- Collez l'URL d'un article Légifrance ou son identifiant `LEGIARTI...`.
-- Charge l'article avec `POST /consult/getArticle`, puis **cherche sa version en vigueur aujourd'hui par CID** (`POST /consult/getArticleByCid`) si l'identifiant fourni est historique.
-- **N'analyse jamais silencieusement une ancienne rédaction** : si la version actuelle ne peut pas être confirmée, un message explique le problème ; vous pouvez alors choisir le mode « Version exacte de l’URL ».
-- Permet de basculer entre **« Version en vigueur aujourd’hui » (défaut)** et **« Version exacte de l’URL » (historique)**.
-- Regroupe les citations sortantes indexées par `POST /consult/relatedLinksArticle` (`liensCite`, **pas** `liensCitePar`) et les liens `LEGIARTI`/`JORFARTI` détectés dans son `texteHtml`.
-- Vérifie l'état juridique et les dates des références `LEGIARTI` via `POST /consult/getArticle`.
-- Lorsque nécessaire, tente `POST /consult/getArticleByCid` pour distinguer une ancienne version d'un article toujours en vigueur.
-- Tente `POST /consult/concordanceLinksArticle` pour identifier de possibles correspondances lors de remplacements ou renumérotations.
-- Affiche **le texte intégral avec une présentation inspirée de Légifrance**, en préservant paragraphes et listes, avec un surlignage vert (en vigueur), jaune (alerte potentielle), bleu (ancienne version), gris (indéterminé) et violet (mention sans cible résolue).
-- Affiche un tableau filtrable, des indicateurs, les avertissements, les mentions textuelles non résolues et un export CSV indiquant **l’identifiant saisi et la version réellement analysée**.
-- Nettoie le HTML retourné par PISTE : seuls les éléments textuels sûrs sont affichés, sans script ou attribut injectables.
+- **Un article :** conserve la récupération de la version en vigueur à partir d'un ancien `LEGIARTI`; une case permet d'examiner volontairement la version historique fournie.
+- **Un titre / une section :** coller l'URL Légifrance d'une section de code contenant `LEGITEXT…/LEGISCTA…`.
+- **Un code entier :** coller une URL contenant `LEGITEXT…`, charger le sommaire, sélectionner éventuellement une section, puis analyser par lots de 10, 25 ou 40 articles. La suite est lancée automatiquement par défaut ; on peut suspendre après le lot courant.
+- **Suggestions de correction :** recherche des concordances via `/consult/concordanceLinksArticle`, contrôle de leur vigueur et comparaison textuelle des dispositions. Une seule concordance actuelle + rédaction strictement identique (à espaces et balisage près) = « Correction proposée ». Si la rédaction diffère, « Correction à vérifier ». Plusieurs correspondances ou absence de texte = pas de correction certaine. **Une ancienne version d'un même article ne constitue pas une correction de référence.**
+- **Lecture annotée :** article source avec les renvois surlignés et, le cas échéant, des extraits comparatifs.
+- **Export CSV** des renvois examinés ; interface épurée, page mentions légales.
 
-## Démarrage local — aucune bibliothèque à installer
+## Installer sur Render
 
-**Prérequis :** Python 3.10 ou version plus récente.
+1. Remplacer `server.py`, `static/index.html`, `static/app.js` et `static/style.css` de la v2 par les fichiers de ce ZIP. **Ajouter aussi** `static/mentions-legales.html`.
+2. Faire un **Commit** dans GitHub. Render redéploiera automatiquement si « Auto Deploy » est activé.
+3. Conserver les commandes : **Build** `echo "No dependencies"` et **Start** `python server.py`.
+4. Conserver les variables existantes `PISTE_CLIENT_ID`, `PISTE_CLIENT_SECRET`, `PISTE_ENV=production`, `HOST=0.0.0.0` et `MAX_REFERENCES=100`. **Ne jamais mettre le secret OAuth dans GitHub.**
+5. Ajouter les variables facultatives ou requises ci-dessous dans **Render → Environment** :
 
-1. Créez un compte sur <https://piste.gouv.fr/>, acceptez les CGU de l'API Légifrance et ajoutez l'API Légifrance à votre application PISTE (production ou sandbox).
-2. Dupliquez `.env.example` en `.env` dans ce dossier.
-3. Remplissez les deux champs `PISTE_CLIENT_ID` et `PISTE_CLIENT_SECRET`. Si vos clés sont de sandbox, choisissez `PISTE_ENV=sandbox`.
-4. Démarrez l'application : `python server.py` dans ce dossier (sur Windows, vous pouvez aussi double-cliquer `lancer_windows.bat`).
-5. Ouvrez <http://127.0.0.1:8765> dans votre navigateur.
-
-**Exemple de `.env` :**
-
-```dotenv
-PISTE_ENV=production
-PISTE_CLIENT_ID=votre_client_id
-PISTE_CLIENT_SECRET=votre_client_secret
-MAX_REFERENCES=100
-```
-
-Le fichier `.env` est volontairement exclu du dépôt Git. Les clés ne sont **jamais envoyées au navigateur** : seul le serveur Python les lit.
-
-## Fonctionnement et états
-
-| État affiché | Signification |
+| Variable | Rôle |
 |---|---|
-| En vigueur | La version citée est indiquée comme en vigueur à la date du contrôle. |
-| Ancienne version | L'identifiant cité n'est plus actuel, mais une version en vigueur du **même CID** a été identifiée. |
-| Alerte potentielle | La référence est indiquée abrogée/remplacée et aucune version courante n'a été confirmée. Ce n'est **pas** une preuve d'erreur. |
-| Indéterminé | L'information retournée par l'API ne permet pas de conclure (article JORF, échec d'appel, absence de dates, etc.). |
+| `APP_ACCESS_PASSWORD` | **Recommandé** : protège les audits et le quota PISTE par un mot de passe demandé dans la page. À laisser absent seulement si l'accès public est souhaité. |
+| `JOB_BATCH_MAX` | Maximum d'articles traités par lot (40 par défaut ; plafond technique 100). |
+| `BULK_REF_LIMIT` | Maximum de renvois analysés par article dans les lots (25 par défaut). Un dépassement est signalé comme **partiel**. Le mode article conserve `MAX_REFERENCES`. |
+| `SITE_EDITOR_NAME` | Nom de l'éditeur / responsable de publication. |
+| `SITE_EDITOR_EMAIL` | Adresse de contact. |
+| `SITE_EDITOR_ADDRESS` | Adresse de l'éditeur. |
+| `SITE_EDITOR_PHONE` | Téléphone de l'éditeur. |
 
-La concordance avec un autre identifiant est affichée en **hypothèse**, jamais en correction automatique.
+**Mentions légales à compléter avant la mise en ligne publique** : les variables `SITE_EDITOR_*` ne sont pas renseignées par défaut. Vérifier aussi les mentions de confidentialité selon les traitements réellement mis en place. Il n'est pas nécessaire de créer un `requirements.txt`.
 
-### Limites importantes
+### Utilisation en local
 
-- Les liens indexés par Légifrance ne prouvent pas qu'une référence se trouve dans le *corps de la rédaction* ; seuls les liens réellement présents dans le HTML sont surlignés comme renvois vérifiés. Les références indexées uniquement figurent dans la liste avec un avertissement.
-- Les surlignages violets indiquent des motifs textuels non résolus : ils ne signifient **pas** que la référence est erronée.
-- Le mode historique vérifie les cibles **à la date actuelle**, pas automatiquement à la date historique. Ce point est signalé par l'interface.
-- Les mentions textuelles sans hyperlien et les renvois implicites ne sont pas tous identifiables automatiquement ; quelques formes `article L. 123-1` sont listées à titre indicatif, sans être considérées comme vérifiées.
-- Les résultats de `getArticleByCid` peuvent être incomplets ou de structure différente selon les fonds : dans ce cas l'application préfère « indéterminé » à une conclusion erronée.
-- Un article abrogé peut être cité volontairement pour une situation passée. Une renumérotation ne signifie pas systématiquement que le renvoi est juridiquement erroné.
-- Les URL de consultation Légifrance reconstituées (`codes/article_lc` et `loda/article_lc`) peuvent nécessiter une correction manuelle suivant le fonds.
-- Les quotas PISTE s'appliquent : nombre maximal de cibles analysées par requête `MAX_REFERENCES` (100 par défaut), 4 appels simultanés au plus. Les références au-delà de cette limite sont signalées mais non contrôlées.
-- **Nécessite des clés PISTE personnelles :** le fonctionnement externe ne peut pas être testé sans elles. Les tests inclus couvrent l'analyse sur données simulées.
+`python server.py` (Python 3.10+), puis `http://127.0.0.1:8765`. Pour un usage local, copier `.env.example` en `.env` et y renseigner les identifiants. Ne jamais committer `.env`.
 
-## Mettre à jour votre application Render / GitHub
+### Endpoints
 
-1. Dans le dépôt GitHub qui est déjà lié à Render, **remplacez** `server.py`, `static/index.html`, `static/app.js` et `static/style.css` par les fichiers de ce ZIP. Vous pouvez remplacer aussi `README.md` et `tests/test_server.py`.
-2. Sur GitHub, validez avec **Commit changes**. Vérifiez que l'arborescence conserve bien le dossier `static/`.
-3. Si Auto-Deploy est activé, Render reconstruit automatiquement le service ; sinon, dans Render, cliquez sur **Manual Deploy → Deploy latest commit**.
-4. Gardez les paramètres Render déjà fonctionnels : **Build Command** `echo "No dependencies"`, **Start Command** `python server.py`, et les variables d'environnement existantes (`HOST=0.0.0.0`, `PISTE_CLIENT_ID`, `PISTE_CLIENT_SECRET`, etc.).
-5. Rechargez la page (Ctrl+F5) : vous devriez voir le choix « version en vigueur / version exacte » et le texte annoté.
+- `GET /api/health` : état du serveur et indication de protection.
+- `POST /api/analyze` : `{ "article": "LEGIARTI...", "mode": "actuel" }` ou `"historique"`.
+- `POST /api/outline` : `{ "value": "https://...LEGITEXT...", "type": "code" }` ou `"section"` (dans ce cas l'URL doit inclure `LEGISCTA...`).
+- `POST /api/jobs` : `{ "ids": ["LEGIARTI...", ...], "offset": 0, "count": 25 }`, retour d'un identifiant de tâche.
+- `GET /api/jobs/<id>` : progression de la tâche et résultats du lot.
+- `GET /mentions-legales` : mentions du site ; `GET /api/legal` fournit les informations d'éditeur configurées.
 
-**Ne mettez jamais `.env` dans GitHub.** Le ZIP ne contient aucun secret. Pensez à protéger l'usage public de l'API par une authentification / limitation de débit si vous ouvrez l'application à des tiers.
+Si `APP_ACCESS_PASSWORD` est défini, les endpoints d'audit exigent `X-LexiCheck-Access` dans l'en-tête. **Ne jamais y placer le secret OAuth PISTE.**
 
-## Tester les règles sans identifiants
+## Couverture et limites
 
-```bash
-python -m unittest discover -s tests -v
-```
+- Les appels officiels sont : `/consult/legi/tableMatieres`, `/consult/getArticle`, `/consult/getArticleByCid`, `/consult/relatedLinksArticle` et `/consult/concordanceLinksArticle`.
+- Le sommaire doit être fourni par l'API et peut être incomplet selon les textes et la date. Si aucun article n'est trouvé, l'application refuse de présenter un audit vide comme exhaustif.
+- Les liens structurés et liens HTML peuvent manquer certains renvois implicites ou non hyperliés. Les métadonnées de citation ne prouvent pas qu'une référence figure littéralement dans le corps du texte.
+- Les comparaisons portent sur **le contenu intégral** des articles (suppression des balises, normalisation Unicode et blancs), et non sur leur seul intitulé. La similarité en pourcentage porte au maximum sur les 5 000 premiers caractères et ne vaut pas preuve d'équivalence juridique.
+- Un article abrogé cité aujourd'hui n'est **pas automatiquement une erreur** (situations transitoires, historiques, etc.). Les propositions ne modifient aucun texte officiel et nécessitent une validation humaine.
+- **Render gratuit :** les jobs tournent dans la mémoire du serveur et peuvent disparaître si l'instance s'endort ou redémarre ; l'interface doit rester ouverte pour enchaîner les lots. Une analyse d'un très grand code peut prendre longtemps et atteindre les quotas PISTE. Un déploiement persistant avec file de tâches est recommandé pour un audit national exhaustif. Le bouton « Suspendre » empêche d'enchaîner les nouveaux lots mais laisse terminer le lot engagé.
+- Par défaut, les lots de 40 articles maximum limitent les appels simultanés à PISTE. Un lot peut prendre plusieurs minutes. Des articles manquants sont listés comme erreurs : **ne pas interpréter ces absences comme des articles sans problème**.
 
-## Sources officielles
+## Tests
 
-- [DILA – FAQ API Légifrance](https://www.legifrance.gouv.fr/contenu/pied-de-page/foire-aux-questions-api)
-- [API Légifrance sur data.gouv.fr](https://www.data.gouv.fr/dataservices/legifrance)
-- [Portail PISTE](https://piste.gouv.fr/)
+`python -m unittest discover -s tests -v`
 
-## Structure
+24 tests unitaires passent avec réponses API simulées. Le frontend a été testé en navigateur avec réponses simulées sur ordinateur et mobile. **Les nouveaux parcours en masse restent à vérifier avec des identifiants PISTE réels.**
 
-```text
-server.py          # Serveur web local + client OAuth 2.0 PISTE + logique de vérification
-static/index.html  # Interface une page
-static/style.css   # Style responsive
-static/app.js      # Recherche, filtres, export CSV, rendu des résultats
-.env.example       # Configuration à dupliquer (ne jamais publier vos clés)
-tests/             # Tests unitaires sans accès à PISTE
-lancer_windows.bat # Démarrage Windows
-```
+## Crédits et conditions
+
+Textes et métadonnées : Légifrance / DILA, Licence ouverte 2.0, sous réserve des CGU de PISTE et de l'API Légifrance. LexiCheck est indépendant de la DILA.

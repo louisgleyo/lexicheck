@@ -1,79 +1,46 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Audit des renvois juridiques d'un article de Légifrance, grâce à l'API officielle PISTE.">
-  <meta name="theme-color" content="#09162e">
-  <title>LexiCheck — Audit des renvois Légifrance</title>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="description" content="LexiCheck : analyse des renvois juridiques à partir de l'API officielle Légifrance.">
+  <title>LexiCheck — Contrôle des renvois juridiques</title>
   <link rel="stylesheet" href="/style.css">
   <script defer src="/app.js"></script>
 </head>
 <body>
-  <div class="site-frame">
-    <header class="topbar">
-      <div class="brand"><div class="brand-icon" aria-hidden="true"><span>§</span></div><div class="brand-name">lexi<span>check</span><small>VÉRIFICATION DES RENVOIS</small></div></div>
-      <div class="top-actions"><span class="connection" id="connection"><i></i> Vérification de la connexion…</span><a href="https://piste.gouv.fr/" target="_blank" rel="noopener noreferrer" class="text-link">Portail PISTE <span aria-hidden="true">↗</span></a></div>
-    </header>
+  <div class="shell">
+    <header class="topbar"><a class="wordmark" href="/">LexiCheck<span class="brand-dot">.</span></a><div class="top-right"><span id="connection" class="connection">Connexion…</span><a href="/mentions-legales">Mentions légales</a></div></header>
     <main>
-      <section class="hero" aria-labelledby="hero-title">
-        <div class="hero-inner">
-          <div class="eyebrow"><span class="eyebrow-mark"></span> INTELLIGENCE JURIDIQUE · API LÉGIFRANCE</div>
-          <h1 id="hero-title">Chaque renvoi.<br><em>Vérifié à la source.</em></h1>
-          <p class="hero-desc">Un article, tous ses renvois identifiables. Repérez les références abrogées, les anciennes versions et les concordances possibles, à partir des données officielles.</p>
-          <form id="analyze-form" class="search-form" novalidate>
-            <label for="article-input">ARTICLE À ANALYSER</label>
-            <div class="input-shell"><span class="input-symbol" aria-hidden="true">§</span><input id="article-input" name="article" type="text" required autocomplete="off" spellcheck="false" placeholder="Collez une URL Légifrance ou un identifiant LEGIARTI…"><button type="submit" id="analyze-button"><span id="button-label">Analyser les renvois</span><span class="arrow" aria-hidden="true">→</span></button></div>
-            <div class="form-foot"><span>Exemple : <button type="button" class="inline-sample" id="sample">LEGIARTI000006307920</button></span><span>Contrôle des renvois à la date du jour</span></div>
-            <fieldset class="version-select"><legend>VERSION DU TEXTE À EXAMINER</legend><label class="version-option"><input type="radio" name="mode" value="actuel" checked><span>Version en vigueur aujourd'hui <small>Recommandé</small></span></label><label class="version-option"><input type="radio" name="mode" value="historique"><span>Version exacte de l'URL <small>Historique</small></span></label></fieldset>
-          </form>
-        </div>
-        <div class="hero-art" aria-hidden="true">
-          <div class="orb"></div><div class="orb-sm"></div>
-          <svg class="network" viewBox="0 0 410 350" fill="none"><path d="M194 143 90 68M194 143 319 62M194 143 325 202M194 143 114 274M194 143 277 299" stroke="#7293cf" stroke-opacity=".37" stroke-width="1.6" stroke-dasharray="4 7"/><circle cx="194" cy="143" r="44" fill="#2e548b" stroke="#8fb2f4" stroke-width="1.5"/><circle cx="194" cy="143" r="26" fill="#3d67a4"/><path d="M183 155h22m-22-12h22m-22-12h22" stroke="white" stroke-width="3" stroke-linecap="round"/><circle cx="90" cy="68" r="25" fill="#132949" stroke="#5c7bab"/><circle cx="319" cy="62" r="25" fill="#132949" stroke="#5c7bab"/><circle cx="325" cy="202" r="25" fill="#132949" stroke="#5c7bab"/><circle cx="114" cy="274" r="25" fill="#132949" stroke="#5c7bab"/><circle cx="277" cy="299" r="25" fill="#132949" stroke="#5c7bab"/><path d="m83 68 5 5 9-11M307 62h23m-12-12v23" stroke="#7dd3ac" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="m315 190 18 23m0-23-18 23" stroke="#f7bb8e" stroke-width="2.4" stroke-linecap="round"/><path d="M104 273h20" stroke="#96b5f5" stroke-width="3" stroke-linecap="round"/><path d="M277 287v14m0 6v1" stroke="#f0cb89" stroke-width="3" stroke-linecap="round"/></svg>
-          <div class="art-tag tag-a"><span class="green-dot"></span> En vigueur</div><div class="art-tag tag-b"><span class="orange-dot"></span> À examiner</div>
-        </div>
+      <section class="intro"><div class="eyebrow">AUDIT JURIDIQUE</div><h1>Vérifier les renvois d'un texte.</h1><p>Analyse des références, détection des dispositions abrogées et suggestions de correction à partir des données Légifrance.</p></section>
+      <section class="form-panel" aria-label="Nouvelle analyse">
+        <div class="scope-switch" role="group" aria-label="Périmètre d'analyse"><button type="button" class="scope active" data-kind="article">Un article</button><button type="button" class="scope" data-kind="section">Un titre / une section</button><button type="button" class="scope" data-kind="code">Un code entier</button></div>
+        <form id="form" novalidate>
+          <label for="url-input" id="url-label">Lien ou identifiant de l'article</label>
+          <div class="input-line"><input id="url-input" type="text" autocomplete="off" spellcheck="false" placeholder="https://www.legifrance.gouv.fr/codes/article_lc/LEGIARTI…" required><button type="submit" id="primary-btn">Analyser <span aria-hidden="true">→</span></button></div>
+          <div class="form-options"><label id="password-option" class="password-option hidden">Code d’accès <input type="password" autocomplete="current-password" id="app-password" placeholder="Code privé"></label><label id="history-option" class="check"><input type="checkbox" id="historical"> Examiner exactement cette version historique</label><span id="input-help">La version en vigueur est analysée par défaut.</span></div>
+        </form>
+        <div id="error" class="error hidden" role="alert"></div>
       </section>
-      <section class="workspace" aria-label="Espace de résultats">
-        <div class="workspace-heading"><div><div class="overline">TABLEAU DE BORD</div><h2>Résultats de l'analyse</h2></div><span class="date-pill" id="date-pill">Aucune analyse lancée</span></div>
-        <div id="error-box" class="error-box hidden" role="alert"></div>
-        <div id="loading" class="loading-panel hidden" aria-live="polite"><div class="spinner"></div><div><strong>Analyse en cours</strong><p>Interrogation de Légifrance, contrôle des versions et recherche des concordances. Cela peut prendre du temps si l'article cite beaucoup de références.</p></div></div>
-        <div class="stats" aria-live="polite">
-          <div class="stat-card"><div class="stat-head"><span>Renvois vérifiés</span><div class="stat-symbol blue">⌁</div></div><strong id="stat-total">—</strong><small>Références identifiées et traitées</small></div>
-          <div class="stat-card"><div class="stat-head"><span>Alertes potentielles</span><div class="stat-symbol red">!</div></div><strong id="stat-alertes">—</strong><small>Abrogés ou remplacés</small></div>
-          <div class="stat-card"><div class="stat-head"><span>Versions antérieures</span><div class="stat-symbol amber">↺</div></div><strong id="stat-versions">—</strong><small>Article encore en vigueur</small></div>
-          <div class="stat-card"><div class="stat-head"><span>En vigueur</span><div class="stat-symbol green">✓</div></div><strong id="stat-valides">—</strong><small>Versions citées en vigueur</small></div>
-        </div>
-        <section class="text-panel" id="text-panel" aria-labelledby="text-title">
-          <div class="text-panel-head">
-            <div><div class="overline">LECTURE ANNOTÉE · STYLE LÉGIFRANCE</div><h3 id="text-title">Texte de l'article et renvois surlignés</h3><p id="text-explanation" class="text-description">Le texte intégral de l'article analysé apparaîtra ici, avec ses références colorées.</p></div>
-            <a id="document-link" href="https://www.legifrance.gouv.fr/" class="button-outline" target="_blank" rel="noopener noreferrer" hidden>Voir l'article officiel ↗</a>
-          </div>
-          <div id="version-banner" class="version-banner hidden"></div>
-          <div class="article-legend" aria-label="Code couleur des renvois"><span><i class="swatch swatch-green"></i> En vigueur</span><span><i class="swatch swatch-yellow"></i> Alerte potentielle</span><span><i class="swatch swatch-blue"></i> Ancienne version</span><span><i class="swatch swatch-gray"></i> Indéterminé</span><span><i class="swatch swatch-purple"></i> Mention non résolue</span></div>
-          <div class="legal-document">
-            <div class="legal-document-top"><span>RÉPUBLIQUE FRANÇAISE · TEXTE CONSOLIDÉ</span><span>Source : Légifrance / DILA</span></div>
-            <div class="legal-document-header"><div id="document-parent">Article de code</div><h4 id="document-heading">Article à analyser</h4><p id="document-dates">Saisissez une référence pour afficher sa rédaction.</p></div>
-            <div id="document-body" class="legal-document-body"><p class="document-placeholder">Le texte intégral, sa structure et ses renvois apparaîtront ici après l'analyse.</p></div>
-          </div>
-          <p class="text-disclaimer">Surlignage indicatif et non officiel. Seuls les renvois identifiés peuvent être contrôlés automatiquement ; un article abrogé n'implique pas toujours une erreur de renvoi.</p>
-        </section>
-        <div class="columns">
-          <section class="results-panel" aria-labelledby="results-title">
-            <div class="panel-head"><div><div class="overline">DÉTAIL DES RÉFÉRENCES</div><h3 id="results-title">Renvois de l'article <span class="count-inline" id="result-count"></span></h3></div><button id="export-button" class="button-outline" type="button" disabled>↓ Export CSV</button></div>
-            <div class="filters" id="filters" role="group" aria-label="Filtrer les résultats"><button class="filter active" data-filter="tous" type="button">Tous</button><button class="filter" data-filter="alerte" type="button">Alertes</button><button class="filter" data-filter="ancienne_version" type="button">Anciennes versions</button><button class="filter" data-filter="vigoureux" type="button">En vigueur</button><button class="filter" data-filter="indetermine" type="button">Indéterminés</button></div>
-            <div class="filter-input"><span aria-hidden="true">⌕</span><input id="filter-text" type="search" placeholder="Rechercher une référence ou un identifiant…" aria-label="Rechercher dans les renvois" disabled></div>
-            <div id="results-list" class="result-list"><div class="empty-state"><div class="empty-icon">§</div><strong>Prêt à examiner vos renvois</strong><p>Collez l'URL d'un article de code ou son identifiant LEGIARTI pour lancer la première analyse.</p></div></div>
-          </section>
-          <aside class="right-column" aria-label="Article source et méthode">
-            <section class="aside-card"><div class="aside-title"><span class="small-square">§</span><h3>Article analysé</h3></div><div id="source-card"><div class="source-empty">L'article source apparaîtra ici une fois l'analyse terminée.</div></div></section>
-            <section class="aside-card"><div class="aside-title"><span class="small-square pale">◎</span><h3>Couverture & limites</h3></div><ul class="method-list"><li><span class="method-dot blue-bg"></span> Citations indexées par Légifrance</li><li><span class="method-dot blue-bg"></span> Surlignage du texte intégral</li><li><span class="method-dot blue-bg"></span> Vérification des versions historiques</li><li><span class="method-dot blue-bg"></span> Concordances éventuelles</li></ul><p class="aside-note">Une alerte n'est pas une preuve d'erreur juridique. Les renvois implicites ou purement textuels peuvent échapper à la résolution.</p></section>
-            <section class="aside-card hidden" id="warnings-card"><div class="aside-title"><span class="small-square warn">!</span><h3>Points à examiner</h3></div><div id="warnings-list" class="warnings-list"></div></section>
-          </aside>
-        </div>
-        <footer class="footer"><span>LexiCheck v2 · Démonstrateur d'analyse juridique</span><span>Source : <a href="https://www.legifrance.gouv.fr/contenu/pied-de-page/foire-aux-questions-api" target="_blank" rel="noopener noreferrer">API officielle Légifrance / DILA</a> · Résultats à vérifier juridiquement</span></footer>
+      <section id="outline-panel" class="outline-panel hidden"><div class="section-head"><div><h2 id="outline-title">Périmètre chargé</h2><p id="outline-info" class="muted"></p></div><button id="launch-bulk" type="button" class="solid-btn">Lancer l'analyse</button></div>
+        <div class="outline-controls"><label for="section-select">Partie à analyser<select id="section-select"><option value="">Code entier</option></select></label><label for="batch-size">Articles par lot<select id="batch-size"><option value="10">10</option><option value="25" selected>25</option><option value="40">40</option></select></label><label class="check auto"><input type="checkbox" id="auto-next" checked> Continuer automatiquement</label></div>
+        <p class="micro">Un code important peut nécessiter de nombreux appels PISTE. Le navigateur doit rester ouvert pour enchaîner les lots. La progression en cours n'est pas conservée si Render redémarre.</p>
+      </section>
+      <section id="progress-panel" class="progress-panel hidden" aria-live="polite"><div class="progress-top"><span id="progress-message">Analyse en cours…</span><span id="progress-counter">0/0</span></div><div class="track"><div id="progress-bar" class="track-fill"></div></div><div class="progress-actions"><button type="button" class="link-button" id="pause-btn">Suspendre après ce lot</button><button type="button" class="link-button hidden" id="continue-btn">Analyser le lot suivant →</button></div></section>
+      <section id="results" class="results hidden" aria-live="polite"><div class="section-head result-heading"><div><h2>Résultats</h2><p id="result-subtitle" class="muted">Contrôle effectué aujourd'hui</p></div><button id="export-btn" class="quiet-btn" type="button">Exporter CSV ↓</button></div>
+        <div class="summary" id="summary"></div>
+        <div class="filter-bar"><div class="filters" role="group" aria-label="Filtrer les résultats"><button class="filter is-active" data-filter="issues">À examiner</button><button class="filter" data-filter="all">Tous</button><button class="filter" data-filter="ok">Sans alerte</button></div><input type="search" id="search-filter" placeholder="Filtrer…" aria-label="Filtrer les articles ou références"></div>
+        <div id="items" class="items"></div>
+      </section>
+      <section id="reader" class="reader hidden" aria-label="Lecture d'un article">
+        <div class="section-head reader-head"><div><div class="eyebrow">LECTURE ANNOTÉE</div><h2 id="reader-title">Article</h2><p id="reader-dates" class="muted"></p></div><a id="reader-link" href="#" target="_blank" rel="noopener noreferrer" class="external">Légifrance ↗</a></div>
+        <div id="version-note" class="notice hidden"></div>
+        <div class="legend"><span><i class="dot green"></i> En vigueur</span><span><i class="dot yellow"></i> À vérifier</span><span><i class="dot blue"></i> Ancienne version</span><span><i class="dot gray"></i> Indéterminé</span><span><i class="dot purple"></i> Non résolu</span></div>
+        <div id="article-text" class="article-text"></div>
+        <h3 class="detail-heading">Renvois identifiés</h3><div id="reference-list" class="reference-list"></div>
       </section>
     </main>
+    <footer><span>LexiCheck · Données : <a href="https://www.legifrance.gouv.fr/" target="_blank" rel="noopener noreferrer">Légifrance / DILA</a> (Licence ouverte 2.0)</span><span><a href="/mentions-legales">Mentions légales et confidentialité</a> · Outil non officiel, vérification juridique nécessaire</span></footer>
   </div>
 </body>
 </html>

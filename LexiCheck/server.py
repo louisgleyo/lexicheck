@@ -5,8 +5,12 @@ Dépendances : bibliothèque standard Python 3.10+ uniquement.
 from __future__ import annotations
 
 import concurrent.futures
+import difflib
+import uuid
+import unicodedata
 import datetime as dt
 import html
+import hmac
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -16,13 +20,17 @@ import re
 import threading
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 ARTICLE_RE = re.compile(r"LEGIARTI\d{12}", re.IGNORECASE)
 OTHER_RE = re.compile(r"(?:JORFARTI|KALIARTI)\d{12}", re.IGNORECASE)
-MAX_WORKERS = 4
+MAX_WORKERS = 3
+TEXT_RE = re.compile(r"LEGITEXT\d{12}", re.I)
+SECTION_RE = re.compile(r"LEGISCTA\d{12}", re.I)
+JOB_BATCH_MAX = max(5, min(int(os.environ.get("JOB_BATCH_MAX", "40")), 100))
+BULK_REF_LIMIT = max(1, min(int(os.environ.get("BULK_REF_LIMIT", "25")), 100))
 
 
 def load_dotenv() -> None:
@@ -100,6 +108,7 @@ class PisteClient:
         if endpoint not in {
             "consult/getArticle", "consult/relatedLinksArticle",
             "consult/getArticleByCid", "consult/concordanceLinksArticle",
+            "consult/legi/tableMatieres", "consult/code",
         }:
             raise APIError("Endpoint refusé.", 500)
         token = self.token()
@@ -203,7 +212,7 @@ def extract_references(article: dict, links: dict) -> tuple[list[dict], list[str
             "sources": ["indexation"], "evidence": "Lien répertorié par Légifrance",
             "nature": str(e.get("nature") or ""),
         }
-    source_html = str(article.get("texteHtml") or article.get("texte") or "")
+    source_html = str(article.get("texteHtml") or article.get("texte") or article.get("content") or "")
     parser = AnchorCollector()
     parser.feed(source_html)
     for href, label in parser.links:
@@ -447,7 +456,7 @@ def legal_article_url(ident: str, nature: str = "") -> str:
 
 
 def render_annotated_html(article: dict, checked: list[dict]) -> tuple[str, int, set[str]]:
-    raw = str(article.get("texteHtml") or article.get("texte") or "")
+    raw = str(article.get("texteHtml") or article.get("texte") or article.get("content") or "")
     if not raw:
         return "", 0, set()
     if "<" not in raw:
@@ -462,7 +471,7 @@ def candidates_from_concordance(data: dict, old_id: str) -> list[dict]:
     for entry in data.get("newTexts", []) or []:
         if not isinstance(entry, dict):
             continue
-        ident = str(entry.get("id") or "").upper()
+        ident = str(entry.get("id") or entry.get("articleId") or "").upper()
         if not ARTICLE_RE.fullmatch(ident) or ident == old_id or ident in seen:
             continue
         seen.add(ident)
@@ -471,11 +480,84 @@ def candidates_from_concordance(data: dict, old_id: str) -> list[dict]:
     return result[:12]
 
 
+def comparable_content(article: dict) -> str:
+    """Texte de la disposition (hors métadonnées), normalisé sans corriger sa rédaction."""
+    raw = str(article.get("texteHtml") or article.get("texte") or article.get("content") or "")
+    if not raw:
+        return ""
+    txt = clean_text(raw)
+    return " ".join(unicodedata.normalize("NFKC", txt).replace("\u00a0", " ").split())
+
+
+def propose_replacement(client: PisteClient, old_article: dict, candidates: list[dict], day: dt.date) -> dict:
+    """Comparaison lexicale stricte, sans inférence juridique ni choix arbitraire."""
+    output = {"statut": "aucune", "libelle": "Pas de remplacement certain", "candidats": []}
+    if not candidates:
+        return output
+    old_text = comparable_content(old_article)
+    results = []
+    for item in candidates[:5]:
+        ident = item.get("id", "")
+        if not ARTICLE_RE.fullmatch(ident):
+            continue
+        try:
+            article = client.article(ident)
+            # Les concordances renvoient parfois une ancienne version du nouveau numéro.
+            if not live_version(article, day):
+                try:
+                    cid = str(article.get("cid") or ident)
+                    versions = client.versions(cid) if callable(getattr(client, "versions", None)) else flatten_versions(client.call("consult/getArticleByCid", {"cid": cid}))
+                    live = [v for v in versions if live_version(v, day)]
+                    if live:
+                        article = client.article(live[0]["id"])
+                except APIError:
+                    pass
+            current = live_version(article, day)
+            new_text = comparable_content(article)
+            identity = bool(current and old_text and new_text and old_text == new_text)
+            similarity, excerpt_old, excerpt_new = None, "", ""
+            if old_text and new_text:
+                if old_text == new_text:
+                    similarity = 100.0
+                else:
+                    # Comparaison indicative, plafonnée pour rester rapide sur les articles très longs.
+                    matcher = difflib.SequenceMatcher(None, old_text[:5000], new_text[:5000], autojunk=True)
+                    similarity = round(matcher.ratio()*100, 1)
+                    for operation, i1, i2, j1, j2 in matcher.get_opcodes():
+                        if operation != "equal":
+                            excerpt_old = old_text[max(0,i1-75):min(len(old_text),max(i2,i1+1)+75)]
+                            excerpt_new = new_text[max(0,j1-75):min(len(new_text),max(j2,j1+1)+75)]
+                            break
+                    if not excerpt_old and not excerpt_new:
+                        excerpt_old = old_text[:200]
+                        excerpt_new = new_text[:200]
+            results.append({"id": article.get("id") or ident, "numero": article.get("num"),
+                            "enVigueur": current, "identique": identity, "similarite": similarity,
+                            "texteDisponible": bool(old_text and new_text),
+                            "extraitAncien": excerpt_old, "extraitNouveau": excerpt_new})
+        except (APIError, KeyError):
+            results.append({"id": ident, "enVigueur": False, "identique": False,
+                            "similarite": None, "texteDisponible": False})
+    # Déduplique les identifiants *courants* ; il peut exister plusieurs concordances vers le même article.
+    results = list({x["id"]: x for x in results}.values())
+    output["candidats"] = results
+    live = [x for x in results if x["enVigueur"]]
+    if len(live) == 1 and len(results) == 1 and live[0]["identique"]:
+        output.update({"statut": "proposition", "libelle": "Correction proposée · rédaction identique",
+                       "id": live[0]["id"], "identique": True})
+    elif len(live) == 1 and len(results) == 1:
+        output.update({"statut": "verification", "libelle": "Correction à vérifier · rédaction différente ou indisponible",
+                       "id": live[0]["id"], "identique": False})
+    elif live:
+        output.update({"statut": "ambigu", "libelle": "Plusieurs concordances · pas de correction automatique"})
+    return output
+
+
 def inspect_reference(client: PisteClient, entry: dict, today: dt.date) -> dict:
     res = dict(entry)
     res.update({"etat": "", "statut": "indetermine", "raison": "État non vérifié.",
                 "dateFin": None, "dateDebut": None, "versionActuelle": None,
-                "concordances": []})
+                "concordances": [], "suggestion": {"statut": "aucune", "libelle": "Aucune correction proposée"}})
     ident = entry["id"]
     if not ARTICLE_RE.fullmatch(ident):
         res["raison"] = "L'identifiant ne désigne pas un article LEGI : contrôle automatique indisponible."
@@ -507,6 +589,9 @@ def inspect_reference(client: PisteClient, entry: dict, today: dt.date) -> dict:
             if winning.get("id") != ident:
                 res["statut"] = "ancienne_version"
                 res["raison"] = "L'identifiant cité désigne une version antérieure, mais l'article possède une version actuellement en vigueur."
+                version_info = propose_replacement(client, target, [{"id": winning["id"]}], today)
+                version_info.update({"statut": "version", "libelle": "Version actuelle du même article · aucun changement de référence nécessaire", "id": winning["id"]})
+                res["suggestion"] = version_info
             else:
                 res["statut"] = "vigoureux"
                 res["raison"] = "Article actuellement en vigueur, confirmé par son historique."
@@ -527,6 +612,7 @@ def inspect_reference(client: PisteClient, entry: dict, today: dt.date) -> dict:
                 res["concordances"] = candidates_from_concordance(concordance, ident)
                 if res["concordances"]:
                     res["raison"] += " Une correspondance possible est renseignée par Légifrance (non validée juridiquement)."
+                    res["suggestion"] = propose_replacement(client, target, res["concordances"], today)
             except APIError as exc:
                 res["notesConcordance"] = exc.message
     except APIError as exc:
@@ -534,7 +620,7 @@ def inspect_reference(client: PisteClient, entry: dict, today: dt.date) -> dict:
     return res
 
 
-def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode: str = "actuel") -> dict:
+def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode: str = "actuel", *, bulk: bool = False) -> dict:
     today = today or dt.date.today()
     source_id = parse_article_id(value)
     original, supplied, warnings = choose_source_version(client, source_id, today, mode)
@@ -546,17 +632,18 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
         warnings.append("Citations indexées indisponibles : " + exc.message)
     entries, unresolved = extract_references(original, links)
     total = len(entries)
-    if total > MAX_REFERENCES:
-        warnings.append(f"Seuls les {MAX_REFERENCES} premiers renvois identifiés ont été vérifiés (sur {total}). Modifiez MAX_REFERENCES pour augmenter cette limite.")
-        entries = entries[:MAX_REFERENCES]
+    ref_limit = min(MAX_REFERENCES, BULK_REF_LIMIT) if bulk else MAX_REFERENCES
+    if total > ref_limit:
+        warnings.append(f"Seuls les {ref_limit} premiers renvois identifiés ont été vérifiés (sur {total}). Résultat partiel.")
+        entries = entries[:ref_limit]
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         checked = list(pool.map(lambda entry: inspect_reference(client, entry, today), entries))
     checked.sort(key=lambda x: {"alerte": 0, "indetermine": 1, "ancienne_version": 2, "vigoureux": 3}.get(x["statut"], 4))
     counts = {key: sum(x["statut"] == key for x in checked) for key in ("alerte", "indetermine", "ancienne_version", "vigoureux")}
-    decorated, colored, actual_ids = render_annotated_html(original, checked)
-    if not any("texte" in e["sources"] for e in entries):
+    decorated, colored, actual_ids = render_annotated_html(original, checked) if not bulk else ("", 0, set())
+    if not bulk and not any("texte" in e["sources"] for e in entries):
         warnings.append("Aucun hyperlien LEGI/JORF n'a été trouvé dans le HTML : les citations indexées ne garantissent pas que les renvois figurent dans la rédaction.")
-    if any(x["id"] not in actual_ids for x in checked):
+    if not bulk and any(x["id"] not in actual_ids for x in checked):
         warnings.append("Certaines références ne sont visibles que dans l'indexation Légifrance : elles ne sont pas surlignées dans le corps de l'article.")
     source_nature = "CODE" if "/codes/" in value.lower() else ("LODA" if "/loda/" in value.lower() else "CODE")
     return {"article": article_summary(original), "articleDemandee": article_summary(supplied),
@@ -564,13 +651,163 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
             "sourceHtmlAnnote": decorated, "renvoisSurlignes": colored,
             "dateAnalyse": today.isoformat(), "renvois": checked, "totalIdentifies": total, "comptes": counts,
             "mentionsNonResolues": unresolved, "avertissements": warnings,
-            "limite": MAX_REFERENCES}
+            "limite": ref_limit}
+
+
+def parse_scope(value: str, kind: str) -> tuple[str, str | None]:
+    """Scope via URL Légifrance : titre = LEGITEXT + LEGISCTA."""
+    text_id = TEXT_RE.search(value or "")
+    section_id = SECTION_RE.search(value or "")
+    if not text_id:
+        raise APIError("Collez l'URL d'un code contenant son identifiant LEGITEXT.", 400)
+    if kind == "section" and not section_id:
+        raise APIError("Pour un titre ou une section, collez l'URL Légifrance contenant LEGITEXT et LEGISCTA.", 400)
+    return text_id.group().upper(), section_id.group().upper() if section_id else None
+
+
+def list_articles_in_tree(root: dict, day: dt.date, section_id: str | None = None) -> dict:
+    """Construit une liste déterministe depuis l'arborescence API, sans inventer des articles."""
+    seen: set[str] = set()
+    articles: list[dict] = []
+    sections: list[dict] = []
+    matched = section_id is None
+    found_section = False
+
+    def record_article(a: dict, path: list[str]):
+        ident = str(a.get("id") or "").upper()
+        if not ARTICLE_RE.fullmatch(ident) or ident in seen:
+            return
+        state = normalize_state(a)
+        if state.startswith(("ABROGE", "PERIME", "TRANSFERE", "REMPLACE")):
+            return
+        if (a.get("dateDebut") or a.get("dateFin")) and not active_on(a, day):
+            return
+        seen.add(ident)
+        articles.append({"id": ident, "numero": str(a.get("num") or ""), "chemin": " / ".join(path)})
+
+    def walk(node: dict, path: list[str], within: bool, depth: int):
+        nonlocal matched, found_section
+        if depth > 35 or not isinstance(node, dict):
+            return
+        ident = str(node.get("cid") or node.get("id") or "").upper()
+        title = str(node.get("title") or node.get("titre") or "Section")
+        is_match = bool(section_id and (section_id == ident or section_id == str(node.get("id") or "").upper()))
+        if is_match:
+            found_section = True
+        take = within or is_match or section_id is None
+        children = node.get("sections") or []
+        nested_path = path + ([title] if title else [])
+        if section_id is None or take or depth == 0:
+            sections.append({"id": ident, "titre": title, "niveau": depth, "actif": take})
+        if take:
+            for a in node.get("articles") or []:
+                if isinstance(a, dict):
+                    record_article(a, nested_path)
+        for child in children:
+            walk(child, nested_path, take, depth + 1)
+
+    # Root contains first-level sections and possibly articles.
+    if section_id is None:
+        for a in root.get("articles") or []:
+            if isinstance(a, dict):
+                record_article(a, [])
+    for child in root.get("sections") or []:
+        walk(child, [], section_id is None, 0)
+    if section_id is not None and not found_section:
+        raise APIError("Section LEGISCTA introuvable dans le sommaire de ce code à la date du jour.", 404)
+    return {"articles": articles, "sections": sections, "nombre": len(articles), "titre": root.get("title") or "Code"}
+
+
+def get_outline(client: PisteClient, value: str, kind: str, day: dt.date | None = None) -> dict:
+    day = day or dt.date.today()
+    text_id, section_id = parse_scope(value, kind)
+    req = {"date": day.isoformat() + "T00:00:00.000Z", "textId": text_id, "nature": "CODE"}
+    tree = client.call("consult/legi/tableMatieres", req)
+    if not isinstance(tree, dict):
+        raise APIError("Le sommaire renvoyé par PISTE est inexploitable.", 502)
+    outline = list_articles_in_tree(tree, day, section_id)
+    # Ne pas afficher un total rassurant si le sommaire est incomplet.
+    if not outline["nombre"]:
+        raise APIError("Aucun article en vigueur n'a pu être énuméré dans ce périmètre. Vérifiez l'URL et le sommaire Légifrance.", 422)
+    return {**outline, "textId": text_id, "sectionId": section_id, "date": day.isoformat(), "type": kind}
+
+
+class AuditJob:
+    def __init__(self, ids: list[str], offset: int, count: int):
+        self.id = uuid.uuid4().hex
+        self.ids = ids[offset:offset+count]
+        self.offset = offset
+        self.total_scope = len(ids)
+        self.next_offset = min(len(ids), offset+count)
+        self.progress = 0
+        self.results: list[dict] = []
+        self.errors: list[dict] = []
+        self.done = False
+        self.started = time.monotonic()
+        self.lock = threading.Lock()
+
+    def status(self) -> dict:
+        with self.lock:
+            return {"jobId": self.id, "totalLot": len(self.ids), "traites": self.progress,
+                    "totalScope": self.total_scope, "offset": self.offset, "nextOffset": self.next_offset,
+                    "termine": self.done, "resultats": list(self.results), "erreurs": list(self.errors)}
+
+    def run(self):
+        for article_id in self.ids:
+            try:
+                full = analyze(CLIENT, article_id, mode="actuel", bulk=True)
+                relevant = [r for r in full["renvois"] if r["statut"] != "vigoureux"]
+                row = {"id": full["article"]["id"], "titre": full["article"]["titre"],
+                       "numero": full["article"]["numero"], "comptes": full["comptes"],
+                       "totalIdentifies": full["totalIdentifies"], "limite": full["limite"],
+                       "renvois": relevant, "avertissements": full["avertissements"]}
+                with self.lock:
+                    self.results.append(row)
+            except Exception as exc:
+                with self.lock:
+                    # Pas de secret ni d'URL privée dans l'erreur.
+                    self.errors.append({"id": article_id, "erreur": exc.message if isinstance(exc, APIError) else "Erreur interne d'analyse"})
+            finally:
+                with self.lock:
+                    self.progress += 1
+            time.sleep(0.12)
+        with self.lock:
+            self.done = True
+
+
+JOBS: dict[str, AuditJob] = {}
+JOBS_LOCK = threading.Lock()
+
+
+def create_job(ids: list[str], offset: int, count: int) -> AuditJob:
+    ids = list(dict.fromkeys(ids))
+    if not ids or len(ids) > 50000 or not all(ARTICLE_RE.fullmatch(x) for x in ids):
+        raise APIError("Liste d'articles invalide.", 400)
+    if offset < 0 or offset >= len(ids):
+        raise APIError("Curseur hors de portée.", 400)
+    count = min(max(1, count), JOB_BATCH_MAX)
+    with JOBS_LOCK:
+        for key, job in list(JOBS.items()):
+            if job.done and time.monotonic()-job.started > 3600:
+                del JOBS[key]
+        if any(not job.done for job in JOBS.values()):
+            raise APIError("Une analyse de lot est déjà en cours sur cette instance. Réessayez après sa fin.", 409)
+        job = AuditJob(ids, offset, count)
+        JOBS[job.id] = job
+    threading.Thread(target=job.run, daemon=True, name="lexicheck-job").start()
+    return job
 
 
 CLIENT = PisteClient()
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _authorized(self) -> bool:
+        expected = os.getenv("APP_ACCESS_PASSWORD", "")
+        if not expected:
+            return True
+        return hmac.compare_digest(self.headers.get("X-LexiCheck-Access", ""), expected)
+
     def _respond(self, status: int, payload: bytes, content_type: str):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -587,10 +824,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         paths = {"/": ("index.html", "text/html; charset=utf-8"),
                  "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-                 "/style.css": ("style.css", "text/css; charset=utf-8")}
+                 "/style.css": ("style.css", "text/css; charset=utf-8"),
+                 "/mentions-legales": ("mentions-legales.html", "text/html; charset=utf-8")}
         if self.path == "/api/health":
             return self._json(200, {"status": "ok", "configured": bool(CLIENT.client_id and CLIENT.client_secret),
-                                    "environment": os.getenv("PISTE_ENV", "production")})
+                                    "environment": os.getenv("PISTE_ENV", "production"),
+                                    "protected": bool(os.getenv("APP_ACCESS_PASSWORD", ""))})
+        if self.path.startswith("/api/jobs/"):
+            if not self._authorized():
+                return self._json(401, {"erreur": "Code d'accès invalide."})
+            job_id = self.path[len("/api/jobs/"):]
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+            if not job:
+                return self._json(404, {"erreur": "Analyse introuvable ou perdue après redémarrage du serveur."})
+            return self._json(200, job.status())
+        if self.path == "/api/legal":
+            return self._json(200, {"editor": os.getenv("SITE_EDITOR_NAME", "À renseigner"),
+                     "email": os.getenv("SITE_EDITOR_EMAIL", "À renseigner"),
+                     "address": os.getenv("SITE_EDITOR_ADDRESS", "À renseigner"),
+                     "phone": os.getenv("SITE_EDITOR_PHONE", "À renseigner")})
         if self.path not in paths:
             return self._json(404, {"erreur": "Page inconnue."})
         filename, mime = paths[self.path]
@@ -599,14 +852,31 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(200, content, mime)
 
     def do_POST(self):
-        if self.path != "/api/analyze":
+        if self.path not in {"/api/analyze", "/api/outline", "/api/jobs"}:
             return self._json(404, {"erreur": "Endpoint inconnu."})
+        if not self._authorized():
+            return self._json(401, {"erreur": "Code d'accès invalide."})
         try:
             count = int(self.headers.get("Content-Length", "0"))
-            if count < 2 or count > 8192:
+            if count < 2 or count > 3500000:
                 raise APIError("Requête vide ou trop volumineuse.", 400)
             body = json.loads(self.rfile.read(count))
-            if not isinstance(body, dict) or not isinstance(body.get("article"), str):
+            if not isinstance(body, dict):
+                raise APIError("Corps JSON attendu.", 400)
+            if self.path == "/api/outline":
+                if not isinstance(body.get("value"), str) or body.get("type") not in {"code", "section"}:
+                    raise APIError("Fournir l'URL d'un code ou d'une section.", 400)
+                return self._json(200, get_outline(CLIENT, body["value"], body["type"]))
+            if self.path == "/api/jobs":
+                ids = body.get("ids")
+                if not isinstance(ids, list):
+                    raise APIError("Liste d'articles manquante.", 400)
+                try:
+                    job = create_job(ids, int(body.get("offset", 0)), int(body.get("count", 25)))
+                except (TypeError, ValueError):
+                    raise APIError("Paramètre de lot invalide.", 400)
+                return self._json(202, job.status())
+            if not isinstance(body.get("article"), str):
                 raise APIError("Fournir un champ article (URL ou identifiant).", 400)
             result = analyze(CLIENT, body["article"], mode=body.get("mode", "actuel"))
             self._json(200, result)
