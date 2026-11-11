@@ -24,7 +24,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from code_catalog import OFFICIAL_CODE_TITLES
 
-APP_VERSION = "3.9.0"
+APP_VERSION = "3.10.0"
 ROOT = Path(__file__).resolve().parent
 ARTICLE_RE = re.compile(r"LEGIARTI\d{12}", re.IGNORECASE)
 OTHER_RE = re.compile(r"(?:JORFARTI|KALIARTI)\d{12}", re.IGNORECASE)
@@ -38,6 +38,8 @@ AUTO_RESOLVE_BULK_LIMIT = max(0, min(int(os.environ.get("AUTO_RESOLVE_BULK_LIMIT
 CONCORDANCE_MAX_CALLS = max(1, min(int(os.environ.get("CONCORDANCE_MAX_CALLS", "9")), 20))
 CONCORDANCE_MAX_HOPS = max(1, min(int(os.environ.get("CONCORDANCE_MAX_HOPS", "3")), 4))
 CONCORDANCE_VERSION_PROBES = max(1, min(int(os.environ.get("CONCORDANCE_VERSION_PROBES", "5")), 10))
+METADATA_MATCH_LIMIT = max(0, min(int(os.environ.get("METADATA_MATCH_LIMIT", "18")), 60))
+METADATA_MATCH_BULK_LIMIT = max(0, min(int(os.environ.get("METADATA_MATCH_BULK_LIMIT", "6")), 25))
 
 
 def load_dotenv() -> None:
@@ -743,6 +745,172 @@ def code_for_mention(full_text: str, position: int, source_article: dict) -> str
     return codes[0] if len(codes) == 1 else None
 
 
+
+# Liaison entre mentions littérales et indexation Légifrance :
+# l'indexation apporte des candidats, jamais une preuve sans confrontation
+# au numéro et au contexte du renvoi réellement présent dans le texte.
+LAW_TITLE_RE = re.compile(
+    r"\b(?P<type>loi|ordonnance|décret)\s+(?:n[°ºo]\s*|numéro\s*)"
+    r"(?P<numero>\d{2,4}\s*[-–‑]\s*\d{1,6})", re.I)
+
+
+def _law_identity_from_title(value: str) -> tuple[str, str] | None:
+    m = LAW_TITLE_RE.search(str(value or ""))
+    return (m.group("type").casefold(), normalize_text_number(m.group("numero"))) if m else None
+
+
+def _append_text_binding(entry: dict, kind: str, start: int, end: int, number: str) -> None:
+    sources = entry.setdefault("sources", [])
+    for source in ("texte_litteral", kind):
+        if source not in sources:
+            sources.append(source)
+    marker = {"start": start, "end": end, "numero": number}
+    positions = entry.setdefault("mentionsConfirmees", [])
+    if marker not in positions:
+        positions.append(marker)
+
+
+def resolve_from_indexed_metadata(client: PisteClient, article: dict,
+                                  entries: list[dict], unresolved: list[str], bulk: bool
+                                  ) -> tuple[list[dict], list[str], list[str]]:
+    """Rapproche l'indexation des renvois du texte, sans inférer de cible arbitraire.
+
+    N'accepte une correspondance que si le numéro réel, le nom du code
+    (ou le numéro de loi) et, s'il existe, le CID sont compatibles.
+    Quand deux CID restent possibles, la mention demeure non résolue.
+    Les consultations de fiches d'articles sont plafonnées pour limiter PISTE.
+    """
+    raw = str(article.get("texteHtml") or article.get("texte") or article.get("content") or "")
+    flat = cohesive_text(raw)
+    legal_mentions, _ = textual_mentions(flat)
+    law_mentions = normative_mentions(flat)
+    indexed = [e for e in entries if "indexation" in (e.get("sources") or [])]
+    if not indexed or not (legal_mentions or law_mentions):
+        return entries, unresolved, []
+
+    # La simple présence du numéro dans le titre indexé n'est PAS une
+    # vérification : la version précédente accordait une confiance excessive.
+    for e in indexed:
+        if "texte" not in (e.get("sources") or []):
+            e["sources"] = [x for x in e.get("sources", []) if x != "texte_litteral"]
+    wanted_numbers = {n for m in legal_mentions for n in m["numbers"]}
+    wanted_laws = {(m["numero"], m["texteNumero"], m["typeTexte"]) for m in law_mentions}
+    # Les métadonnées portant directement un numéro ont priorité ;
+    # les autres ne sont interrogées que dans la limite du budget.
+    def priority(entry):
+        name = str(entry.get("titre") or "")
+        nums = indexed_article_numbers(entry)
+        law = _law_identity_from_title(name)
+        return (0 if (nums & wanted_numbers or (law and any(
+            law == (k[2], k[1]) for k in wanted_laws))) else 1,
+            name.casefold())
+    ordered = sorted(indexed, key=priority)
+    limit = METADATA_MATCH_BULK_LIMIT if bulk else METADATA_MATCH_LIMIT
+    consulted = 0
+    verified: list[tuple[dict, dict]] = []
+    failures = 0
+    source_id = str(article.get("id") or "").upper()
+    for e in ordered:
+        if consulted >= limit:
+            break
+        ident = str(e.get("id") or "").upper()
+        if ident == source_id or not ARTICLE_RE.fullmatch(ident):
+            continue
+        consulted += 1
+        try:
+            target = client.article(ident)
+        except (APIError, KeyError, TypeError, AttributeError):
+            failures += 1
+            continue
+        if str(target.get("id") or "").upper() != ident:
+            continue
+        verified.append((e, target))
+
+    # Une fiche renvoyée sans textTitles ne prouve pas l'identité du code.
+    def legitimate_code(entry: dict, target: dict, expected: str) -> bool:
+        if not expected:
+            return False
+        official = article_code_titles(target)
+        if official:
+            return any(code_title_verifies_reference(expected, x) for x in official)
+        # Certains getArticle ne renseignent pas textTitles : dans ce cas,
+        # le libellé de l'indexation fait foi UNIQUEMENT si la nature est CODE
+        # et si le numéro est confirmé indépendamment par getArticle.
+        if str(entry.get("nature") or "").upper() != "CODE":
+            return False
+        name = str(entry.get("titre") or "")
+        return any(code_title_verifies_reference(expected, m.group())
+                   for m in CODE_NAMES_PATTERN.finditer(name))
+
+    # Évite les collisions entre articles de codes différents et versions d'un
+    # même CID. Les correspondances avec plusieurs CID ne sont PAS résolues.
+    def choose(candidates: list[tuple[dict, dict]]):
+        groups: dict[str, list[tuple[dict, dict]]] = {}
+        for entry, target in candidates:
+            cid = str(target.get("cid") or target.get("id") or entry["id"]).upper()
+            groups.setdefault(cid, []).append((entry, target))
+        if len(groups) != 1:
+            return None
+        unique = next(iter(groups.values()))
+        unique.sort(key=lambda pair: reference_version_rank(pair[1], dt.date.today()), reverse=True)
+        return unique[0][0]
+
+    attached_law_keys = set()
+    for mention in legal_mentions:
+        code = (code_for_mention(flat, mention["end"], article)
+                or code_for_mention(flat, mention["start"], article))
+        for number in mention["numbers"]:
+            matches = [(entry, target) for entry, target in verified
+                       if normalize_article_number(str(target.get("num") or "")) == number
+                       and legitimate_code(entry, target, code)]
+            chosen = choose(matches)
+            if chosen is not None:
+                _append_text_binding(chosen, "metadonnees_rapprochees",
+                                     mention["start"], mention["end"], number)
+    for mention in law_mentions:
+        key = (mention["numero"], mention["texteNumero"], mention["typeTexte"])
+        matches = []
+        for entry, target in verified:
+            num = re.sub(r"\s+", " ", str(target.get("num") or "")).strip().casefold()
+            if num != mention["numero"].casefold():
+                continue
+            titles = article_code_titles(target)
+            if titles:
+                valid_law = any(_law_identity_from_title(title) == (key[2], key[1]) for title in titles)
+            else:
+                # Vérification sur l'identité du texte dans le lien indexé,
+                # uniquement en l'absence de titres officiels sur la fiche.
+                valid_law = (str(entry.get("nature") or "").upper() in
+                             {"LOI", "ORDONNANCE", "DECRET", "DÉCRET", "LODA"}
+                             and _law_identity_from_title(entry.get("titre") or "") == (key[2], key[1]))
+            if valid_law:
+                matches.append((entry, target))
+        chosen = choose(matches)
+        if chosen is None:
+            continue
+        chosen.update({"numero": key[0], "texteNumero": key[1], "typeTexte": key[2], "nature": "LODA"})
+        _append_text_binding(chosen, "metadonnees_rapprochees",
+                             mention["start"], mention["end"], key[0])
+        attached_law_keys.add(key)
+
+    resolved_numbers = {pos["numero"] for entry in entries
+                        if set(entry.get("sources") or []) & {"texte", "texte_litteral", "recherche_numero", "metadonnees_rapprochees"}
+                        for pos in entry.get("mentionsConfirmees") or []}
+    # Ancrage HTML : sa cible est directement connue pour un renvoi isolé.
+    resolved_numbers.update(n for e in entries if "texte" in (e.get("sources") or [])
+                            for n in indexed_article_numbers(e))
+    # Les anciennes mentions non résolues sont conservées, sauf si un numéro
+    # de cette occurrence précise a désormais été rattaché.
+    remaining = [x for x in unresolved
+                 if not (normalize_article_number(x) and normalize_article_number(x) in resolved_numbers)]
+    notes = []
+    if failures:
+        notes.append(f"{failures} fiche(s) de citation indexée non récupérable(s) via PISTE : rapprochement partiel.")
+    if len(ordered) > limit and (wanted_numbers or wanted_laws):
+        notes.append(f"Rapprochement par métadonnées limité à {limit} lien(s) : vérification potentiellement incomplète.")
+    return entries, remaining, notes
+
+
 def resolve_textual_references(client: PisteClient, article: dict, entries: list[dict],
                                unresolved: list[str], day: dt.date, bulk: bool) -> tuple[list[dict], list[str], list[str]]:
     """Résout individuellement tous les articles d'une plage via numéro + code."""
@@ -757,7 +925,12 @@ def resolve_textual_references(client: PisteClient, article: dict, entries: list
     if not callable(getattr(client, "search_article_number", None)):
         return entries, unresolved, warnings
     done: set[tuple[str, str]] = set()
-    by_num = {n for entry in entries for n in indexed_article_numbers(entry)}
+    # Une citation indexée ne prouve pas que cette référence du texte a été
+    # résolue : ne bloquer la recherche officielle que pour les liaisons
+    # confirmées et celles ancrées dans le HTML.
+    by_num = {n for entry in entries
+              if set(entry.get("sources") or []) & {"texte", "texte_litteral", "recherche_numero", "metadonnees_rapprochees"}
+              for n in indexed_article_numbers(entry)}
     count = 0
     for mention in mentions:
         # Dans une plage, le code figure fréquemment après le dernier numéro.
@@ -1059,9 +1232,18 @@ class SafeArticleRenderer(HTMLParser):
         self.text_offset = 0
         self.open_anchors: list[tuple[str, int]] = []
         self.anchors: list[dict] = []
+        self.by_span_number = {}
         for r in results:
-            for n in indexed_article_numbers(r):
-                self.by_number.setdefault(n, []).append(r)
+            sources = set(r.get("sources") or [])
+            # Une citation uniquement indexée ne doit pas déformer le
+            # surlignage du texte ni rendre un numéro faussement ambigu.
+            if not sources or sources & {"texte", "texte_litteral", "recherche_numero", "metadonnees_rapprochees"}:
+                for n in indexed_article_numbers(r):
+                    self.by_number.setdefault(n, []).append(r)
+            for pos in r.get("mentionsConfirmees") or []:
+                if isinstance(pos, dict):
+                    key = (pos.get("start"), pos.get("end"), pos.get("numero"))
+                    self.by_span_number.setdefault(key, []).append(r)
             if r.get("texteNumero") and r.get("numero"):
                 key = (str(r["numero"]), str(r["texteNumero"]), str(r.get("typeTexte") or "loi"))
                 self.by_normative.setdefault(key, []).append(r)
@@ -1150,7 +1332,9 @@ class SafeArticleRenderer(HTMLParser):
         else:
             refs = []
             for number in mention["numbers"]:
-                candidates = self.by_number.get(number, [])
+                span = (mention["start"], mention["end"], number)
+                confirmed = self.by_span_number.get(span, [])
+                candidates = confirmed if confirmed else self.by_number.get(number, [])
                 if len(candidates) == 1:
                     refs.append(candidates[0])
                 else:
@@ -1523,6 +1707,9 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
         links = {}
         warnings.append("Citations indexées indisponibles : " + exc.message)
     entries, unresolved = extract_references(original, links)
+    entries, unresolved, metadata_notes = resolve_from_indexed_metadata(
+        client, original, entries, unresolved, bulk)
+    warnings.extend(metadata_notes)
     raw_source = str(original.get("texteHtml") or original.get("texte") or original.get("content") or "")
     _, range_warnings = textual_mentions(cohesive_text(raw_source))
     warnings.extend(range_warnings)
@@ -1747,7 +1934,7 @@ class Handler(BaseHTTPRequestHandler):
                  "/style.css": ("style.css", "text/css; charset=utf-8"),
                  "/mentions-legales": ("mentions-legales.html", "text/html; charset=utf-8")}
         if path == "/api/health":
-            return self._json(200, {"status": "ok", "version": APP_VERSION, "build": "catalogue-officiel-generique-2026-11-11", "configured": bool(CLIENT.client_id and CLIENT.client_secret),
+            return self._json(200, {"status": "ok", "version": APP_VERSION, "build": "indexation-raccordement-verifie-2026-11-11", "configured": bool(CLIENT.client_id and CLIENT.client_secret),
                                     "environment": os.getenv("PISTE_ENV", "production"),
                                     "protected": bool(os.getenv("APP_ACCESS_PASSWORD", ""))})
         if path.startswith("/api/jobs/"):

@@ -78,7 +78,7 @@ class MiningRegression(unittest.TestCase):
     def test_full_example_no_manual_senate_and_three_current_articles(self):
         c=FixtureClient()
         d=server.analyze(c,SOURCE,DAY)
-        self.assertEqual(d['versionMoteur'],'3.9.0')
+        self.assertEqual(d['versionMoteur'],'3.10.0')
         self.assertEqual({x['id'] for x in d['renvois']},{MINING_16,MINING_17,CGCT_4433})
         self.assertEqual(d['comptes']['vigoureux'],3)
         self.assertEqual([x['id'] for x in d['liensIndexationSeule']],[INDEX_ONLY])

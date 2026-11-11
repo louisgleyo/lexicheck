@@ -1,36 +1,50 @@
-# LexiCheck v3.9 — catalogue officiel et noms de codes génériques
+# LexiCheck v3.10 — rapprochement des renvois avec les métadonnées Légifrance
 
-**Changement par rapport à la v3.8 :** l'ancienne exception de recherche « Code minier » est supprimée. Les intitulés de codes proviennent maintenant d'un catalogue transversal : `code_catalog.py`, contenant les **108 intitulés** présentés dans [le répertoire Légifrance](https://www.legifrance.gouv.fr/liste/code) consulté le 11 novembre 2026 (y compris les codes historiques).
+Cette version ajoute une étape **générique** de récupération des références textuelles non résolues à partir de l'indexation officielle `liensCite` (endpoint `consult/relatedLinksArticle`). Aucun renvoi, article de remplacement ni exemple parlementaire n'est codé en dur.
 
-## Règles d'attribution et de recherche
+## Fonctionnement
 
-1. Le programme reconnaît les noms officiels des **108 codes**, y compris les apostrophes droites/courbes et certaines variations d'accents ; un code appartenant à un autre alinéa ne doit pas contaminer le suivant.
-2. Lorsque la rédaction cite un code sans qualifier « nouveau », les noms officiels compatibles sont essayés de façon **générique**. Il existe trois paires officiellement qualifiées `(nouveau)` : **Code forestier**, **Code de justice militaire**, **Code minier**. La version « nouveau » est recherchée en priorité lorsqu'elle figure dans le catalogue, puis l'intitulé non qualifié est essayé. Aucune branche n'est propre à un code.
-3. Le programme compare ensuite **le numéro d'article ET l'intitulé du code** renvoyés par l'API avant de retenir un identifiant. Une simple variante de nom **n'établit jamais** une équivalence juridique entre deux codes.
-4. Les mentions **`(ancien)`**, **`(édition 2001)`**, **`(édition 2006)`**, **`(1807)`**, ainsi que les **annexes du CGI** et les variantes territoriales sont maintenues distinctes. Exemple : « Code pénal (ancien) » ne doit pas être ramené au Code pénal actuel. Les différentes éditions du Code des marchés publics ne sont pas choisies par défaut.
-5. Lorsque deux articles distincts restent possibles, LexiCheck **ne choisit pas arbitrairement** : le renvoi est conservé comme ambigu. Pour un code apparu après la date du catalogue, il essaie le nom transmis et sa variante `(nouveau)` sans présumer du résultat.
-6. Les règles génériques de concordance et les contrôles des renvois de la v3.8 restent en place. Aucune suggestion de correction article→article issue d'un exemple sénatorial n'est codée en dur.
+Pour chaque référence réellement présente dans la rédaction :
 
-Le catalogue contient les **noms**, mais ni les dates d'effet consolidées ni une table de concordance entre codes. Un qualificatif éditorial n'implique pas l'identité juridique. Ce changement améliore la **résolution de la cible**, pas l'exhaustivité des concordances entre articles.
+1. L'outil cherche des candidats parmi les liens indexés de **l'article source**. Ces liens ne sont jamais considérés comme des citations rédigées par leur seule présence dans les métadonnées.
+2. Pour chaque lien candidat (budget paramétrable), il consulte la fiche `consult/getArticle` de l'article cité.
+3. Il compare le **numéro effectif** de l'article cité avec le numéro du renvoi, ainsi que son **code** avec le code identifié dans la proposition. L'intitulé `Code minier (nouveau)` peut être rapproché de `Code minier`, mais une homonymie avec un autre code est rejetée. Lorsqu'une fiche d'article n'a pas de `textTitles`, un titre de citation indexée ne peut servir qu'avec une nature `CODE` et un numéro indépendamment confirmé.
+4. Pour les lois/ordonnances/décrets, il rapproche simultanément **type de texte**, **numéro de texte** et **numéro d'article**.
+5. Si plusieurs articles consolidés (`cid`) restent compatibles, aucune cible n'est choisie. Si une seule correspondance est établie, elle est marquée « retrouvée dans les métadonnées Légifrance », puis son état est contrôlé normalement.
+6. Si l'indexation ne résout pas la référence, la **recherche par numéro et code** déjà présente continue de fonctionner. Désormais, un lien seulement indexé avec le même numéro ne court-circuite plus cette recherche.
+7. Les liens indexés **sans correspondance textuelle** restent dans la section repliée, en dehors des anomalies de rédaction.
 
-## Installation sur Render
+La recherche demeure **partielle** si les métadonnées sont lacunaires, si le quota d'appels est atteint ou si les résultats sont ambigus. Aucun modèle d'IA ni similarité approximative ne peut à lui seul justifier l'identification d'un article cible.
 
-Cette version ajoute **un nouveau fichier indispensable** `code_catalog.py`. À la **racine du dépôt GitHub** (au même endroit que `server.py`), ajouter/remplacer :
+## Déployer sur Render
 
-- `server.py` — moteur Python ;
-- `code_catalog.py` — **nouveau catalogue des codes** ;
-- `static/app.js` — numéro de version du frontend ;
-- `static/index.html` — invalidation du cache navigateur.
+Conserver le dépôt existant et ses variables OAuth sur Render. Remplacer :
+- `server.py`
+- `static/app.js`
+- `static/index.html`
 
-Les autres fichiers peuvent rester inchangés. Conserver les clés OAuth PISTE **exclusivement dans Render → Environment**. Les commandes Render restent : **Build** `echo "No dependencies"`, **Start** `python server.py`.
+**Conserver à la racine `code_catalog.py`**, introduit en v3.9 (présent dans le ZIP complet). Ne jamais committer le fichier `.env` ni les secrets PISTE.
 
-Après le commit GitHub et le déploiement, `https://votre-site.onrender.com/api/health` doit indiquer :
+Après le commit et le déploiement, vérifier :
 
-```json
-{"status":"ok","version":"3.9.0","build":"catalogue-officiel-generique-2026-11-11"}
+```
+https://VOTRE-SITE.onrender.com/api/health
 ```
 
-Les autres champs (`configured`, `protected`) sont propres à l'instance. Actualiser ensuite la page avec **Ctrl+F5**.
+Le JSON doit contenir :
+
+```json
+{"status":"ok","version":"3.10.0","build":"indexation-raccordement-verifie-2026-11-11"}
+```
+
+Actualiser ensuite la page avec `Ctrl+F5` pour renouveler le JavaScript.
+
+### Options facultatives
+
+- `METADATA_MATCH_LIMIT=18` : nombre maximal de fiches citées examinées par article isolé.
+- `METADATA_MATCH_BULK_LIMIT=6` : même limite par article en analyse de code/section.
+
+Le moteur de rapprochement effectue des appels API supplémentaires, surtout quand des liens indexés n'ont pas de numéro apparent. Ajuster prudemment ces plafonds en fonction du quota PISTE.
 
 ## Tests
 
@@ -38,4 +52,4 @@ Les autres champs (`configured`, `protected`) sont propres à l'instance. Actual
 python -m unittest discover -s tests -q
 ```
 
-Les tests vérifient la présence des 108 intitulés, les trois suffixes `(nouveau)`, le maintien des versions `(ancien)` et éditions séparées, les accents/apostrophes, la portée locale des citations, et l'extraction via les formats JSON habituels. **Les réponses PISTE sont simulées** : ce correctif ne constitue pas une validation sur les identifiants ou les quotas de ta production. En cas d'échec de résolution réel, inspecter les avertissements de LexiCheck et la réponse de PISTE sans divulguer les secrets.
+Les tests simulent les réponses PISTE, notamment des références avec et sans hyperlien, les noms de codes « (nouveau) », un mauvais code avec numéro homonyme, des liens indexés ambigus, une référence à une loi non codifiée, et des liens qui ne figurent pas dans la rédaction. **Ils ne remplacent pas une validation de bout en bout sur l'API PISTE réelle.**
