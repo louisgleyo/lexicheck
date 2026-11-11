@@ -43,7 +43,7 @@ class RenvoisTests(unittest.TestCase):
         refs, missing = server.extract_references(source, {'liensCite':[{'id':B,'name':'Article B','nature':'CODE'}], 'liensCitePar':[{'id': C}]})
         self.assertEqual(len(refs), 1)
         self.assertEqual(refs[0]['id'], B)
-        self.assertEqual(set(refs[0]['sources']), {'texte','indexation'})
+        self.assertEqual(set(refs[0]['sources']), {'texte','indexation','texte_litteral'})
         self.assertIn('article R. 87-2', missing)
 
     def test_current_article(self):
@@ -146,7 +146,7 @@ class RenvoisTests(unittest.TestCase):
         rendered,n,ids=server.render_annotated_html(source,results)
         self.assertIn('status-alerte',rendered)
         self.assertIn('status-nonresolu',rendered)
-        self.assertIn('article R. 99-1',rendered)
+        self.assertIn('>R. 99-1</mark>',rendered)
         self.assertNotIn('<script',rendered)
         self.assertNotIn('alert(',rendered)
         self.assertNotIn('<img',rendered)

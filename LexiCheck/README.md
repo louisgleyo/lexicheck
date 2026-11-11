@@ -1,3 +1,19 @@
+# LexiCheck v3.1 — correction des renvois sans hyperlien
+
+**Correctif ciblé pour l'article L. 1421-1 du CGCT.** La v3 ne colorait que les liens HTML vers LEGIARTI/JORFARTI, alors que les références présentes dans le texte de l'article peuvent être de simples chaînes de caractères.
+
+- Reconnaissance des mentions typées « L. 212-4 », « L. 212-4-1 », « L. 212-10 », « L. 212-33 » même sans balise `<a>`.
+- Surlignage selon l'état d'une cible LEGIARTI **uniquement lorsqu'une correspondance unique existe parmi les liens indexés ou les hyperliens fournis** ; à défaut, surlignage violet (non résolu), sans conclure qu'elle est en vigueur.
+- Les alertes issues de l'indexation mais ne figurant pas dans le texte restent séparées, sans surlignage artificiel.
+- L'export CSV et les lignes des analyses par lots incluent les références textuelles non résolues. Un article avec des références non résolues n'est plus déclaré « Pas d’alerte détectée ».
+- La détection de plages (« L. 212-4-1 à L. 212-10 ») repère les **bornes**, pas tous les articles intermédiaires : il faut une résolution des plages contre le sommaire du code pour établir leur exhaustivité.
+
+**Déploiement Render :** remplacer `server.py` et `static/app.js` sur GitHub, puis valider le commit. Les paramètres Render, `static/index.html`, `static/style.css` et les secrets PISTE restent inchangés. Pour bénéficier du ZIP complet, le dépôt peut aussi être remplacé par tous ses fichiers en conservant `.env` uniquement en local.
+
+**Tests :** 27 tests locaux, dont reproduction du paragraphe de L. 1421-1 avec un lien indexé vers L. 212-33, et vérification de sa mise en jaune dans le HTML sans aucun `<a>` source. Appels PISTE réels non testés, car les clés du compte ne sont pas disponibles.
+
+---
+
 # LexiCheck v3 — Audit des renvois Légifrance
 
 Application web légère en **Python standard (sans `requirements.txt`)**. Les requêtes OAuth vers PISTE sont effectuées par le serveur, jamais par le navigateur.
@@ -65,3 +81,37 @@ Si `APP_ACCESS_PASSWORD` est défini, les endpoints d'audit exigent `X-LexiCheck
 ## Crédits et conditions
 
 Textes et métadonnées : Légifrance / DILA, Licence ouverte 2.0, sous réserve des CGU de PISTE et de l'API Légifrance. LexiCheck est indépendant de la DILA.
+
+## Nouveau dans v3.2 — Résolution des renvois par numéro
+
+Pour les références textuelles qui ne comportent pas de lien HTML ou d'identifiant
+`LEGIARTI` indexé, LexiCheck tente désormais de retrouver la cible par l'API
+Légifrance `POST /search`, avec les champs **`NUM_ARTICLE`**, **`NOM_CODE`** et
+**`DATE_VERSION`**. Si la disposition n'est plus en vigueur, il recherche ensuite
+une entrée historique (fonds `CODE_ETAT`, puis certaines dates antérieures), et
+vérifie l'identifiant retourné par `POST /consult/getArticle` avant de classer
+le renvoi. La recherche ne déduit jamais un identifiant du seul numéro : le nom
+du code doit être identifiable dans la phrase ou son voisinage.
+
+Le texte comme « articles L. 212-4 et L. 212-33 du code du patrimoine » est donc
+résolu, dans la limite des réponses effectivement fournies par l'API. Si plusieurs
+cibles chronologiques distinctes partagent ce même numéro ou si la recherche
+échoue, le numéro reste « non résolu » pour éviter un faux positif. Les références
+qui visent un code dont le nom n'est pas encore reconnu par le détecteur restent
+également à examiner. L'extraction des références en plages continues, l'inférence
+des codes implicites et l'accès à toute l'histoire d'un article ne sont pas exhaustifs.
+
+Pour maîtriser les quotas lors d'analyses en masse, deux variables facultatives
+peuvent être ajoutées sur Render :
+
+- `AUTO_RESOLVE_LIMIT=20` : maximum de références textuelles recherchées par
+  article dans le mode individuel ;
+- `AUTO_RESOLVE_BULK_LIMIT=6` : maximum par article dans une analyse en masse.
+
+Aucune nouvelle dépendance à installer et aucune nouvelle clé API. Pour déployer
+sur Render, **remplacer uniquement `server.py` dans le dépôt GitHub**, puis
+committer. Les variables PISTE restent inchangées.
+
+Validation : 31 tests unitaires avec simulations de réponses PISTE, dont
+recherche historique et contrôle de l'ambiguïté. Les appels réseau avec de vrais
+identifiants PISTE n'ont pas été exécutés dans cet environnement.

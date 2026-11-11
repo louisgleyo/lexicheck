@@ -31,6 +31,8 @@ TEXT_RE = re.compile(r"LEGITEXT\d{12}", re.I)
 SECTION_RE = re.compile(r"LEGISCTA\d{12}", re.I)
 JOB_BATCH_MAX = max(5, min(int(os.environ.get("JOB_BATCH_MAX", "40")), 100))
 BULK_REF_LIMIT = max(1, min(int(os.environ.get("BULK_REF_LIMIT", "25")), 100))
+AUTO_RESOLVE_LIMIT = max(0, min(int(os.environ.get("AUTO_RESOLVE_LIMIT", "20")), 60))
+AUTO_RESOLVE_BULK_LIMIT = max(0, min(int(os.environ.get("AUTO_RESOLVE_BULK_LIMIT", "6")), 20))
 
 
 def load_dotenv() -> None:
@@ -73,6 +75,7 @@ class PisteClient:
         self._lock = threading.Lock()
         self._article_cache: dict[str, dict] = {}
         self._cache_lock = threading.Lock()
+        self._lookup_cache: dict[tuple[str, str, str], list[str]] = {}
 
     def token(self, force: bool = False) -> str:
         if not self.client_id or not self.client_secret:
@@ -108,7 +111,7 @@ class PisteClient:
         if endpoint not in {
             "consult/getArticle", "consult/relatedLinksArticle",
             "consult/getArticleByCid", "consult/concordanceLinksArticle",
-            "consult/legi/tableMatieres", "consult/code",
+            "consult/legi/tableMatieres", "consult/code", "search",
         }:
             raise APIError("Endpoint refusé.", 500)
         token = self.token()
@@ -152,6 +155,70 @@ class PisteClient:
                 self._article_cache.clear()
             self._article_cache[article_id] = art
         return art
+
+
+    def search_article_number(self, number: str, code_name: str, day: dt.date) -> list[dict]:
+        """Résout (numéro, code) par /search. Une ancienne version reste recherchable.
+
+        Le résultat est confirmé par /consult/getArticle avant toute qualification.
+        Les échecs API se propagent : l'absence de résultat n'est pas une preuve
+        d'inexistence ou d'abrogation.
+        """
+        number = normalize_article_number(number)
+        if not number or not code_name:
+            return []
+        cache_key = (number, code_name.casefold(), day.isoformat())
+        with self._cache_lock:
+            cached_ids = self._lookup_cache.get(cache_key)
+        if cached_ids is not None:
+            ids = cached_ids
+        else:
+            ids = []
+            timestamp = int(dt.datetime.combine(day, dt.time(12), tzinfo=dt.timezone.utc).timestamp() * 1000)
+            def search(fond: str, at_date: int | None):
+                filters = [{"facette": "NOM_CODE", "valeurs": [code_name]}]
+                if at_date is not None:
+                    filters.append({"facette": "DATE_VERSION", "singleDate": at_date})
+                body = {"fond": fond, "recherche": {
+                    "champs": [{"typeChamp": "NUM_ARTICLE", "criteres": [{
+                        "typeRecherche": "EXACTE", "valeur": number, "operateur": "ET"
+                    }], "operateur": "ET"}],
+                    "filtres": filters, "pageNumber": 1, "pageSize": 15,
+                    "operateur": "ET", "sort": "PERTINENCE", "typePagination": "ARTICLE"
+                }}
+                return ids_in_search_response(self.call("search", body))
+            # 1. Version à la date du jour ; 2. index d'états, abrogés compris.
+            ids = search("CODE_DATE", timestamp)
+            if not ids:
+                ids = search("CODE_ETAT", None)
+            # Certains index d'état ne remontent plus les anciens articles.
+            # On tente un petit nombre de dates historiques, sans recherche sans code.
+            if not ids:
+                for year in (2020, 2017, 2010, 2005):
+                    if year >= day.year:
+                        continue
+                    old_at = int(dt.datetime(year, 1, 1, 12, tzinfo=dt.timezone.utc).timestamp() * 1000)
+                    ids = search("CODE_DATE", old_at)
+                    if ids:
+                        break
+            with self._cache_lock:
+                if len(self._lookup_cache) > 500:
+                    self._lookup_cache.clear()
+                self._lookup_cache[cache_key] = ids
+        verified = []
+        for ident in ids[:10]:
+            try:
+                article = self.article(ident)
+            except APIError:
+                continue
+            if normalize_article_number(str(article.get("num") or "")) != number:
+                continue
+            # Le filtre NOM_CODE doit être confirmé si la réponse le permet.
+            code_titles = article_code_titles(article)
+            if code_titles and not any(normalize_code_title(code_name) == normalize_code_title(t) for t in code_titles):
+                continue
+            verified.append(article)
+        return verified
 
 
 class AnchorCollector(HTMLParser):
@@ -199,6 +266,168 @@ def parse_article_id(value: str) -> str:
     return m.group(0).upper()
 
 
+# Une citation n'est pas forcément un lien HTML : Légifrance fournit souvent du texte brut.
+# Le suffixe est borné pour ne pas confondre L. 212-4 et L. 212-4-1.
+LEGAL_NUM_RE = re.compile(r"(?<![\w.-])(?:LO|L|R|D)\s*\.?\s*\d{1,5}(?:\s*-\s*\d{1,5}){1,4}(?![\w-])", re.I)
+ARTICLE_PREFIX_RE = re.compile(r"(?:articles?|art\.)\s*$", re.I)
+
+
+def normalize_article_number(value: str) -> str:
+    m = LEGAL_NUM_RE.search(value or "")
+    return re.sub(r"[\s.]", "", m.group()).upper() if m else ""
+
+
+def indexed_article_numbers(entry: dict) -> set[str]:
+    # L'API fournit parfois « Code du patrimoine - art. L212-33 », parfois seulement
+    # un numéro dans le titre. Ne pas assimiler un titre sans numéro à une citation.
+    output = set()
+    for field in (entry.get("numero"), entry.get("titre"), entry.get("evidence")):
+        if not isinstance(field, str):
+            continue
+        output.update(normalize_article_number(m.group()) for m in LEGAL_NUM_RE.finditer(field))
+    return output - {""}
+
+
+
+def ids_in_search_response(payload: dict) -> list[str]:
+    """Les versions de l'API peuvent ranger les articles dans sections/extracts."""
+    ids: list[str] = []
+    def walk(node, depth: int = 0):
+        if depth > 8 or len(ids) >= 30:
+            return
+        if isinstance(node, dict):
+            ident = str(node.get("id") or "").upper()
+            if ARTICLE_RE.fullmatch(ident) and ident not in ids:
+                ids.append(ident)
+            for key in ("results", "articles", "sections", "extracts", "article", "articleVersions"):
+                if key in node:
+                    walk(node[key], depth+1)
+        elif isinstance(node, list):
+            for x in node[:60]:
+                walk(x, depth+1)
+    walk(payload)
+    return ids
+
+
+def normalize_code_title(value: str) -> str:
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    return re.sub(r"[^a-z0-9]", "", "".join(c for c in value if not unicodedata.combining(c)).lower())
+
+
+def article_code_titles(article: dict) -> list[str]:
+    titles = []
+    for entry in article.get("textTitles") or []:
+        if isinstance(entry, dict):
+            value = entry.get("titre") or entry.get("titreLong") or entry.get("title")
+            if isinstance(value, str) and value.strip():
+                titles.append(value)
+    return titles
+
+
+# Noms complets, pour éviter de chercher « code du patrimoine et des articles ... ».
+# Les autres noms peuvent être ajoutés sans changer le moteur d'analyse.
+KNOWN_CODE_NAMES = (
+    "Code général des collectivités territoriales", "Code de la sécurité sociale",
+    "Code du patrimoine", "Code général des impôts", "Code civil",
+    "Code pénal", "Code de procédure pénale", "Code du travail",
+    "Code de l'éducation", "Code de la santé publique", "Code de l'environnement",
+    "Code de l'urbanisme", "Code de la construction et de l'habitation",
+    "Code de la commande publique", "Code des relations entre le public et l'administration",
+    "Code de la fonction publique", "Code général de la fonction publique",
+    "Code de commerce", "Code des transports", "Code de l'énergie",
+    "Code de justice administrative", "Code de procédure civile",
+    "Code rural et de la pêche maritime", "Code monétaire et financier",
+    "Code des assurances", "Code de la consommation", "Code du sport",
+    "Code des postes et des communications électroniques", "Code de la propriété intellectuelle",
+    "Code de la défense", "Code de l'action sociale et des familles",
+    "Code de la route", "Code du tourisme", "Code électoral",
+    "Code minier", "Code forestier", "Code des douanes",
+)
+CODE_NAMES_PATTERN = re.compile(r"(?<!\w)(?:" + "|".join(
+    re.escape(name).replace("\'", "['’]") for name in sorted(KNOWN_CODE_NAMES, key=len, reverse=True)
+) + r")(?!\w)", re.IGNORECASE)
+
+
+def code_for_mention(full_text: str, position: int, source_article: dict) -> str | None:
+    """Ne résout un renvoi que si son code est explicite dans son contexte.
+
+    Cas classique : « articles L. ... et L. ... du code du patrimoine ».
+    On ne devine jamais le code sur la seule base du numéro.
+    """
+    matches = list(CODE_NAMES_PATTERN.finditer(full_text[max(0, position-600):position+360]))
+    if not matches:
+        tail = full_text[max(0, position-75):position+45].lower()
+        if re.search(r"\b(?:du présent|du même|de ce) code\b", tail):
+            titles = article_code_titles(source_article)
+            return titles[0] if len(titles) == 1 and titles[0].lower().startswith("code ") else None
+        return None
+    start = max(0, position-600)
+    # Préférence au nom situé après le renvoi : « L. 212-33 du code du patrimoine ».
+    nearby = []
+    for m in matches:
+        absolute = start + m.start()
+        dist = absolute - position
+        if 0 <= dist <= 270:
+            rank = dist
+        elif -240 <= dist < 0:
+            rank = 300 + abs(dist)
+        else:
+            continue
+        nearby.append((rank, m.group()))
+    if not nearby:
+        return None
+    nearby.sort(key=lambda item: item[0])
+    return next((name for name in KNOWN_CODE_NAMES if normalize_code_title(name) == normalize_code_title(nearby[0][1])), None)
+
+
+def resolve_textual_references(client: PisteClient, article: dict, entries: list[dict],
+                               unresolved: list[str], day: dt.date, bulk: bool) -> tuple[list[dict], list[str], list[str]]:
+    """Complète l'indexation par NUM_ARTICLE + NOM_CODE + date, en restant prudent."""
+    raw = str(article.get("texteHtml") or article.get("texte") or article.get("content") or "")
+    text = clean_text(raw)
+    todo_numbers = {normalize_article_number(label) for label in unresolved}
+    todo_numbers.discard("")
+    remaining = set(todo_numbers)
+    warnings: list[str] = []
+    limit = AUTO_RESOLVE_BULK_LIMIT if bulk else AUTO_RESOLVE_LIMIT
+    if not callable(getattr(client, "search_article_number", None)):
+        return entries, unresolved, warnings
+    done: set[tuple[str, str]] = set()
+    by_num = {n for entry in entries for n in indexed_article_numbers(entry)}
+    count = 0
+    for match in LEGAL_NUM_RE.finditer(text):
+        number = normalize_article_number(match.group())
+        if number not in remaining or number in by_num:
+            continue
+        code = code_for_mention(text, match.start(), article)
+        if not code or (number, code) in done:
+            continue
+        done.add((number, code))
+        if count >= limit:
+            warnings.append(f"Recherche par numéro limitée à {limit} référence(s) par article : résultat partiel.")
+            break
+        count += 1
+        try:
+            candidates = client.search_article_number(number, code, day)
+        except APIError as exc:
+            warnings.append(f"Recherche de {number} ({code}) indisponible : {exc.message}")
+            continue
+        # Évite de confondre deux articles juridiques distincts partageant un numéro.
+        cids = {str(x.get("cid") or x.get("id")) for x in candidates}
+        if len(cids) != 1 or not candidates:
+            continue
+        candidates.sort(key=lambda x: (live_version(x, day), parsed_date(x.get("dateDebut")) or dt.date.min), reverse=True)
+        chosen = candidates[0]
+        ident = str(chosen["id"]).upper()
+        if ident not in {e["id"] for e in entries}:
+            entries.append({"id": ident, "numero": number, "titre": f"{code} - art. {number}",
+                            "sources": ["texte_litteral", "recherche_numero"],
+                            "evidence": f"Numéro {number} et code vérifiés par la recherche Légifrance",
+                            "nature": "CODE"})
+        remaining.discard(number)
+        by_num.add(number)
+    return entries, [label for label in unresolved if normalize_article_number(label) in remaining], warnings
+
 def extract_references(article: dict, links: dict) -> tuple[list[dict], list[str]]:
     indexed: dict[str, dict] = {}
     for e in links.get("liensCite", []) or []:
@@ -234,19 +463,26 @@ def extract_references(article: dict, links: dict) -> tuple[list[dict], list[str
         elif "/loda/" in href and not entry.get("nature"):
             entry["nature"] = "LODA"
 
-    # Mentions textuelles non appariées à un identifiant : remontées à part, jamais déclarées vérifiées.
+    # Rapprochement *prudent* par numéro : uniquement si une seule cible indexée
+    # correspond. On ne devine jamais un identifiant LEGIARTI à partir d'un numéro seul.
     plain = clean_text(source_html)
-    mentions = re.findall(
-        r"\barticles?\s+(?:L\.?|R\.?|D\.?|LO\.?|[A-Z]{1,3}\.?)\s*\d{1,5}(?:-\d{1,5}){0,4}",
-        plain, flags=re.IGNORECASE,
-    )
-    unresolved = []
-    anchor_labels = " ".join(label for _, label in parser.links).lower().replace(" ", "")
-    for term in dict.fromkeys(mentions):
-        normalized = term.lower().replace(" ", "")
-        if normalized not in anchor_labels:
-            unresolved.append(term)
-    # L'ID source n'est jamais considéré comme un renvoi sortant.
+    by_number: dict[str, list[dict]] = {}
+    for entry in indexed.values():
+        for key in indexed_article_numbers(entry):
+            by_number.setdefault(key, []).append(entry)
+    unresolved: list[str] = []
+    for mention in LEGAL_NUM_RE.finditer(plain):
+        number = normalize_article_number(mention.group())
+        matches = by_number.get(number, [])
+        if len(matches) == 1:
+            entry = matches[0]
+            if "texte_litteral" not in entry["sources"]:
+                entry["sources"].append("texte_litteral")
+        else:
+            prefix = ARTICLE_PREFIX_RE.search(plain[max(0, mention.start()-18):mention.start()])
+            label = (prefix.group().strip() + " " if prefix else "") + mention.group().strip()
+            if label not in unresolved:
+                unresolved.append(label)
     indexed.pop(str(article.get("id") or "").upper(), None)
     return list(indexed.values()), unresolved[:80]
 
@@ -350,14 +586,10 @@ def choose_source_version(client: PisteClient, input_id: str, day: dt.date, mode
 
 
 class SafeArticleRenderer(HTMLParser):
-    """Reconstitue le HTML juridique en conservant seulement une liste de balises sûres.
-
-    Les références sont coloriées selon les contrôles, sans injecter le HTML brut de PISTE.
-    """
+    """Conserve le balisage légal sûr, annote les renvois textuels même sans <a>."""
     SAFE = {"p", "div", "span", "br", "ul", "ol", "li", "b", "strong", "i", "em", "u", "sup", "sub", "blockquote", "h2", "h3", "h4", "table", "thead", "tbody", "tr", "td", "th", "a"}
     VOID = {"br"}
     BLOCKED = {"script", "style", "iframe", "object", "embed", "svg", "math", "template", "form", "textarea", "button", "input"}
-    UNRESOLVED = re.compile(r"\barticles?\s+(?:L\.?|R\.?|D\.?|LO\.?|[A-Z]{1,3}\.?)\s*\d{1,5}(?:-\d{1,5}){0,4}", re.IGNORECASE)
 
     def __init__(self, results: list[dict]):
         super().__init__(convert_charrefs=True)
@@ -366,8 +598,25 @@ class SafeArticleRenderer(HTMLParser):
         self.blocked_depth = 0
         self.link_depth = 0
         self.by_id = {x["id"]: x for x in results}
+        self.by_number: dict[str, list[dict]] = {}
+        for entry in results:
+            for key in indexed_article_numbers(entry):
+                self.by_number.setdefault(key, []).append(entry)
         self.count_highlighted = 0
         self.mentioned_ids: set[str] = set()
+
+    def _color(self, text: str, entry: dict) -> str:
+        uid = entry["id"]
+        status = entry.get("statut", "indetermine")
+        if status not in {"vigoureux", "alerte", "ancienne_version", "indetermine"}:
+            status = "indetermine"
+        dest = legal_article_url(uid, entry.get("nature", ""))
+        self.mentioned_ids.add(uid)
+        self.count_highlighted += 1
+        return (f'<a class="legal-ref status-{status}" href="{html.escape(dest, quote=True)}" '
+                f'target="_blank" rel="noopener noreferrer" data-ref="{uid}" '
+                f'title="{html.escape(entry.get("raison", "Voir sur Légifrance"), quote=True)}">'
+                f'{html.escape(text)}</a>')
 
     def handle_starttag(self, tag: str, attrs):
         tag = tag.lower()
@@ -384,18 +633,17 @@ class SafeArticleRenderer(HTMLParser):
             href = str(dict(attrs).get("href") or "")
             hit = ARTICLE_RE.search(href) or OTHER_RE.search(href)
             entry = self.by_id.get(hit.group(0).upper()) if hit else None
-            # Seuls les identifiants effectivement vérifiés sont codés en couleur.
             if entry:
+                # Lien <a> déjà fourni par PISTE : son contenu est coloré en une fois.
                 status = entry.get("statut", "indetermine")
                 if status not in {"vigoureux", "alerte", "ancienne_version", "indetermine"}:
                     status = "indetermine"
                 uid = entry["id"]
                 dest = legal_article_url(uid, entry.get("nature", ""))
-                self.parts.append(f'<a class="legal-ref status-{status}" href="{html.escape(dest, quote=True)}" target="_blank" rel="noopener noreferrer" data-ref="{uid}" title="{html.escape(entry.get("raison", "Voir cette référence sur Légifrance"), quote=True)}">')
+                self.parts.append(f'<a class="legal-ref status-{status}" href="{html.escape(dest, quote=True)}" target="_blank" rel="noopener noreferrer" data-ref="{uid}" title="{html.escape(entry.get("raison", "Voir sur Légifrance"), quote=True)}">')
                 self.mentioned_ids.add(uid)
                 self.count_highlighted += 1
             else:
-                # On garde la typographie, mais aucun attribut non vérifié.
                 self.parts.append('<span class="reference-unchecked" title="Lien non vérifié">')
             self.stack.append(("a", "a" if entry else "span"))
             self.link_depth += 1
@@ -415,7 +663,6 @@ class SafeArticleRenderer(HTMLParser):
             if tag in self.BLOCKED:
                 self.blocked_depth -= 1
             return
-        # Ignorer une fermeture inattendue plutôt que casser la structure.
         for idx in range(len(self.stack) - 1, -1, -1):
             if self.stack[idx][0] == tag:
                 for original, rendered in reversed(self.stack[idx:]):
@@ -432,10 +679,16 @@ class SafeArticleRenderer(HTMLParser):
             self.parts.append(html.escape(data))
             return
         last = 0
-        for m in self.UNRESOLVED.finditer(data):
-            self.parts.append(html.escape(data[last:m.start()]))
-            self.parts.append('<mark class="legal-ref status-nonresolu" title="Mention textuelle sans identifiant résolu : vérification manuelle nécessaire">' + html.escape(m.group(0)) + '</mark>')
-            last = m.end()
+        for match in LEGAL_NUM_RE.finditer(data):
+            self.parts.append(html.escape(data[last:match.start()]))
+            key = normalize_article_number(match.group())
+            refs = self.by_number.get(key, [])
+            # Aucune vérification fiable si plusieurs codes partagent le numéro.
+            if len(refs) == 1:
+                self.parts.append(self._color(match.group(), refs[0]))
+            else:
+                self.parts.append('<mark class="legal-ref status-nonresolu" title="Référence textuelle non identifiée avec certitude (code ou identifiant LEGIARTI à vérifier)">' + html.escape(match.group()) + '</mark>')
+            last = match.end()
         self.parts.append(html.escape(data[last:]))
 
     def render(self, markup: str) -> str:
@@ -631,6 +884,8 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
         links = {}
         warnings.append("Citations indexées indisponibles : " + exc.message)
     entries, unresolved = extract_references(original, links)
+    entries, unresolved, lookup_warnings = resolve_textual_references(client, original, entries, unresolved, today, bulk)
+    warnings.extend(lookup_warnings)
     total = len(entries)
     ref_limit = min(MAX_REFERENCES, BULK_REF_LIMIT) if bulk else MAX_REFERENCES
     if total > ref_limit:
@@ -641,10 +896,11 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
     checked.sort(key=lambda x: {"alerte": 0, "indetermine": 1, "ancienne_version": 2, "vigoureux": 3}.get(x["statut"], 4))
     counts = {key: sum(x["statut"] == key for x in checked) for key in ("alerte", "indetermine", "ancienne_version", "vigoureux")}
     decorated, colored, actual_ids = render_annotated_html(original, checked) if not bulk else ("", 0, set())
-    if not bulk and not any("texte" in e["sources"] for e in entries):
-        warnings.append("Aucun hyperlien LEGI/JORF n'a été trouvé dans le HTML : les citations indexées ne garantissent pas que les renvois figurent dans la rédaction.")
     if not bulk and any(x["id"] not in actual_ids for x in checked):
-        warnings.append("Certaines références ne sont visibles que dans l'indexation Légifrance : elles ne sont pas surlignées dans le corps de l'article.")
+        count_index_only = sum(x["id"] not in actual_ids for x in checked)
+        warnings.append(f"{count_index_only} lien(s) indexé(s) sans correspondance certaine dans la rédaction : affichés dans les résultats, sans surlignage.")
+    if not bulk and unresolved:
+        warnings.append(f"{len(unresolved)} numéro(s) d'article dans le texte sans identifiant LEGIARTI établi : surlignés en violet, non classés comme valides ou obsolètes.")
     source_nature = "CODE" if "/codes/" in value.lower() else ("LODA" if "/loda/" in value.lower() else "CODE")
     return {"article": article_summary(original), "articleDemandee": article_summary(supplied),
             "sourceNature": source_nature, "versionChangee": selected_id != source_id, "mode": mode,
@@ -760,7 +1016,8 @@ class AuditJob:
                 row = {"id": full["article"]["id"], "titre": full["article"]["titre"],
                        "numero": full["article"]["numero"], "comptes": full["comptes"],
                        "totalIdentifies": full["totalIdentifies"], "limite": full["limite"],
-                       "renvois": relevant, "avertissements": full["avertissements"]}
+                       "renvois": relevant, "mentionsNonResolues": full["mentionsNonResolues"],
+                       "avertissements": full["avertissements"]}
                 with self.lock:
                     self.results.append(row)
             except Exception as exc:
