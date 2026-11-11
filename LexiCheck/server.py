@@ -158,11 +158,12 @@ class PisteClient:
 
 
     def search_article_number(self, number: str, code_name: str, day: dt.date) -> list[dict]:
-        """Résout (numéro, code) par /search. Une ancienne version reste recherchable.
+        """Retrouve le numéro dans un code, y compris ses versions abrogées.
 
-        Le résultat est confirmé par /consult/getArticle avant toute qualification.
-        Les échecs API se propagent : l'absence de résultat n'est pas une preuve
-        d'inexistence ou d'abrogation.
+        IMPORTANT : les versions 'MODIFIE' peuvent être mort-nées (début > fin).
+        Une recherche CODE_ETAT ne garantit pas de retourner la version terminale.
+        On vérifie les articles et on cherche une version historique réellement
+        applicable avant de conclure. Les résultats ambigus restent ambigus.
         """
         number = normalize_article_number(number)
         if not number or not code_name:
@@ -170,11 +171,23 @@ class PisteClient:
         cache_key = (number, code_name.casefold(), day.isoformat())
         with self._cache_lock:
             cached_ids = self._lookup_cache.get(cache_key)
-        if cached_ids is not None:
-            ids = cached_ids
-        else:
-            ids = []
+
+        def verified(ident: str) -> dict | None:
+            try:
+                obj = self.article(ident)
+            except APIError:
+                return None
+            if normalize_article_number(str(obj.get("num") or "")) != number:
+                return None
+            titles = article_code_titles(obj)
+            if titles and not any(normalize_code_title(code_name) == normalize_code_title(t) for t in titles):
+                return None
+            return obj
+
+        if cached_ids is None:
+            found: dict[str, dict] = {}
             timestamp = int(dt.datetime.combine(day, dt.time(12), tzinfo=dt.timezone.utc).timestamp() * 1000)
+
             def search(fond: str, at_date: int | None):
                 filters = [{"facette": "NOM_CODE", "valeurs": [code_name]}]
                 if at_date is not None:
@@ -183,42 +196,40 @@ class PisteClient:
                     "champs": [{"typeChamp": "NUM_ARTICLE", "criteres": [{
                         "typeRecherche": "EXACTE", "valeur": number, "operateur": "ET"
                     }], "operateur": "ET"}],
-                    "filtres": filters, "pageNumber": 1, "pageSize": 15,
+                    "filtres": filters, "pageNumber": 1, "pageSize": 30,
                     "operateur": "ET", "sort": "PERTINENCE", "typePagination": "ARTICLE"
                 }}
-                return ids_in_search_response(self.call("search", body))
-            # 1. Version à la date du jour ; 2. index d'états, abrogés compris.
-            ids = search("CODE_DATE", timestamp)
-            if not ids:
-                ids = search("CODE_ETAT", None)
-            # Certains index d'état ne remontent plus les anciens articles.
-            # On tente un petit nombre de dates historiques, sans recherche sans code.
-            if not ids:
-                for year in (2020, 2017, 2010, 2005):
-                    if year >= day.year:
+                for ident in ids_in_search_response(self.call("search", body)):
+                    if ident in found or len(found) >= 40:
                         continue
-                    old_at = int(dt.datetime(year, 1, 1, 12, tzinfo=dt.timezone.utc).timestamp() * 1000)
-                    ids = search("CODE_DATE", old_at)
-                    if ids:
-                        break
+                    obj = verified(ident)
+                    if obj is not None:
+                        found[ident] = obj
+
+            # 1. Contrôle d'abord la situation actuelle, sans choisir un ID historique.
+            search("CODE_DATE", timestamp)
+            if not any(live_version(a, day) for a in found.values()):
+                # 2. Index des états, y compris les anciennes versions.
+                search("CODE_ETAT", None)
+                # 3. Si cet index ne prouve pas une abrogation, rechercher une
+                # version effectivement applicable avant l'abrogation. Cela évite
+                # notamment la version L212-36 'MODIFIE' aux dates inversées.
+                if not any(terminal_abrogation(a, day) for a in found.values()):
+                    for year in (2020, 2017, 2010, 2005):
+                        if year >= day.year:
+                            continue
+                        old_at = int(dt.datetime(year, 1, 1, 12, tzinfo=dt.timezone.utc).timestamp() * 1000)
+                        search("CODE_DATE", old_at)
+                        if any(terminal_abrogation(a, day) for a in found.values()):
+                            break
+            ids = list(found)
             with self._cache_lock:
                 if len(self._lookup_cache) > 500:
                     self._lookup_cache.clear()
                 self._lookup_cache[cache_key] = ids
-        verified = []
-        for ident in ids[:10]:
-            try:
-                article = self.article(ident)
-            except APIError:
-                continue
-            if normalize_article_number(str(article.get("num") or "")) != number:
-                continue
-            # Le filtre NOM_CODE doit être confirmé si la réponse le permet.
-            code_titles = article_code_titles(article)
-            if code_titles and not any(normalize_code_title(code_name) == normalize_code_title(t) for t in code_titles):
-                continue
-            verified.append(article)
-        return verified
+            return list(found.values())
+
+        return [obj for ident in cached_ids if (obj := verified(ident)) is not None]
 
 
 class AnchorCollector(HTMLParser):
@@ -488,7 +499,9 @@ def resolve_textual_references(client: PisteClient, article: dict, entries: list
             cids = {str(x.get("cid") or x.get("id")) for x in candidates}
             if len(cids) != 1 or not candidates:
                 continue
-            candidates.sort(key=lambda x: (live_version(x, day), parsed_date(x.get("dateDebut")) or dt.date.min), reverse=True)
+            # Ne jamais choisir une version « MODIFIE » mort-née avant la
+            # véritable version terminale « ABROGE » du même article.
+            candidates.sort(key=lambda x: reference_version_rank(x, day), reverse=True)
             chosen = candidates[0]
             ident = str(chosen["id"]).upper()
             if ident not in {e["id"] for e in entries}:
@@ -584,6 +597,29 @@ def active_on(version: dict, day: dt.date) -> bool:
 
 def normalize_state(article: dict) -> str:
     return str(article.get("etat") or "").upper()
+
+
+def effective_period(article: dict) -> bool:
+    """Écarte les versions mort-nées/incohérentes dont début >= fin."""
+    start = parsed_date(article.get("dateDebut"))
+    end = parsed_date(article.get("dateFin"))
+    return not (start and end and start >= end)
+
+
+def terminal_abrogation(article: dict, day: dt.date) -> bool:
+    """Abrogation affirmée par l'état d'une version chronologiquement cohérente."""
+    end = parsed_date(article.get("dateFin"))
+    return (effective_period(article) and normalize_state(article).startswith("ABROGE")
+            and (end is None or end <= day))
+
+
+def reference_version_rank(article: dict, day: dt.date) -> tuple:
+    """Version courante, puis abrogation attestée, puis ancienne version valide."""
+    start = parsed_date(article.get("dateDebut")) or dt.date.min
+    end = parsed_date(article.get("dateFin")) or dt.date.min
+    return (int(live_version(article, day) and effective_period(article)),
+            int(terminal_abrogation(article, day)),
+            int(effective_period(article)), end, start)
 
 
 def source_title(article: dict) -> str:
@@ -980,9 +1016,13 @@ def inspect_reference(client: PisteClient, entry: dict, today: dt.date) -> dict:
                 res["raison"] = "Article actuellement en vigueur, confirmé par son historique."
             return res
         end = parsed_date(target.get("dateFin"))
-        if state.startswith(("ABROGE", "REMPLACE", "PERIME", "TRANSFERE")) and (end is None or end <= today):
+        if state.startswith(("ABROGE", "REMPLACE", "PERIME", "TRANSFERE")) and (end is None or end <= today) and effective_period(target):
             res["statut"] = "alerte"
-            res["raison"] = "Article cité indiqué comme abrogé, remplacé ou transféré ; aucune version courante confirmée. Vérifier le renvoi et son contexte."
+            if state.startswith("ABROGE"):
+                res["raison"] = ("Article abrogé" + (f" depuis le {end.strftime('%d/%m/%Y')}" if end else "") +
+                                  "; aucune version courante confirmée. Renvoi à examiner juridiquement.")
+            else:
+                res["raison"] = "Article cité indiqué comme remplacé ou transféré ; aucune version courante confirmée. Vérifier le renvoi et son contexte."
         elif end and end <= today and state.startswith("MODIFIE"):
             res["statut"] = "indetermine"
             res["raison"] = "Version modifiée et terminée, mais la continuité de l'article n'a pas pu être établie."

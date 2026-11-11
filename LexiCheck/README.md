@@ -46,3 +46,13 @@ Concernant ce cas précis, le Conseil d'État, dans son avis du 25 mai 2023 rela
 - Backend Python 3.10+ sans bibliothèque tierce et secrets OAuth côté serveur.
 
 Données : Légifrance / DILA. LexiCheck est une application indépendante, sans valeur juridique officielle.
+
+## Correctif v3.4 — versions historiques incohérentes (11 novembre 2026)
+
+Un article peut avoir plusieurs versions référencées par Légifrance, dont certaines versions « mort-nées » avec `dateDebut >= dateFin`. Un exemple réel est **L. 212-36 du Code du patrimoine** : la version `LEGIARTI000033463442` n'a pas de période de validité cohérente, tandis que `LEGIARTI000035110347` confirme son abrogation au 1er janvier 2018.
+
+Le résolveur vérifie maintenant les versions retournées par la recherche, explore le fonds historique lorsqu'il ne dispose pas d'une confirmation d'abrogation, écarte les versions dont les dates sont inversées et donne la priorité aux versions établissant explicitement l'abrogation. Si le résultat reste ambigu, il ne transforme pas une simple fin de version `MODIFIE` en abrogation certaine.
+
+Cette amélioration peut augmenter le nombre d'appels PISTE pour les références historiques. Les tests sont simulés : il faut encore valider les réponses de l'API PISTE en production.
+
+**Déploiement :** remplacer uniquement `server.py` dans le dépôt GitHub et enregistrer le commit. Render utilisera les identifiants déjà configurés.
