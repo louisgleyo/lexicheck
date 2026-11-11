@@ -271,6 +271,72 @@ def parse_article_id(value: str) -> str:
 LEGAL_NUM_RE = re.compile(r"(?<![\w.-])(?:LO|L|R|D)\s*\.?\s*\d{1,5}(?:\s*-\s*\d{1,5}){1,4}(?![\w-])", re.I)
 ARTICLE_PREFIX_RE = re.compile(r"(?:articles?|art\.)\s*$", re.I)
 
+# Les plages sont des renvois vers plusieurs articles, pas un simple lien vers
+# le premier numéro. Expansion prudente : mêmes préfixe et sous-niveaux, avec
+# une borne haute pour éviter d'effectuer des centaines d'appels non voulus.
+RANGE_RE = re.compile(
+    r"(?<![\w.-])(?P<first>(?:LO|L|R|D)\s*\.?\s*\d{1,5}(?:\s*-\s*\d{1,5}){1,4})"
+    r"\s+(?:à|au|jusqu['’]à)\s+"
+    r"(?P<last>(?:LO|L|R|D)\s*\.?\s*\d{1,5}(?:\s*-\s*\d{1,5}){1,4})(?![\w-])",
+    re.I,
+)
+MAX_RANGE_ARTICLES = max(2, min(int(os.environ.get("MAX_RANGE_ARTICLES", "40")), 80))
+
+
+def expand_article_range(first: str, last: str) -> list[str] | None:
+    """Énumère une plage simple, ou renvoie None si la numérotation est ambiguë.
+
+    L. 212-34 à L. 212-36 -> L212-34, L212-35, L212-36.
+    L. 212-4-1 à L. 212-10 -> None : structures différentes, pas de
+    fabrication arbitraire de numéros intermédiaires.
+    """
+    left = normalize_article_number(first)
+    right = normalize_article_number(last)
+    m1 = re.fullmatch(r"(LO|L|R|D)(\d+(?:-\d+)*)", left)
+    m2 = re.fullmatch(r"(LO|L|R|D)(\d+(?:-\d+)*)", right)
+    if not m1 or not m2 or m1.group(1) != m2.group(1):
+        return None
+    a, b = m1.group(2).split("-"), m2.group(2).split("-")
+    if len(a) != len(b) or a[:-1] != b[:-1]:
+        return None
+    start, end = int(a[-1]), int(b[-1])
+    if start > end or end - start + 1 > MAX_RANGE_ARTICLES:
+        return None
+    stem = m1.group(1) + ("-".join(a[:-1]) + "-" if len(a) > 1 else "")
+    return [stem + str(n) for n in range(start, end+1)]
+
+
+def textual_mentions(plain_text: str) -> tuple[list[dict], list[str]]:
+    """Identifie les renvois explicites et développe les plages non ambiguës.
+
+    Chaque occurrence contient les numéros à résoudre, avec le même contexte
+    grammatical. Conserve un avertissement quand une plage ne peut pas être
+    développée sans risquer de fabriquer de fausses références.
+    """
+    out: list[dict] = []
+    warnings: list[str] = []
+    ranges = list(RANGE_RE.finditer(plain_text))
+    for m in ranges:
+        numbers = expand_article_range(m.group("first"), m.group("last"))
+        if numbers is None:
+            # Aux frontières des plages complexes on ne vérifie que les deux
+            # références explicites, sans prétendre à l'exhaustivité.
+            numbers = [normalize_article_number(m.group("first")), normalize_article_number(m.group("last"))]
+            warnings.append(f"Plage complexe « {m.group()} » : seuls les deux articles extrêmes sont contrôlables automatiquement.")
+        out.append({"start": m.start(), "end": m.end(), "raw": m.group(),
+                    "numbers": list(dict.fromkeys(numbers)), "plage": True})
+    for m in LEGAL_NUM_RE.finditer(plain_text):
+        if any(group.start() <= m.start() < group.end() for group in ranges):
+            continue
+        out.append({"start": m.start(), "end": m.end(), "raw": m.group(),
+                    "numbers": [normalize_article_number(m.group())], "plage": False})
+    out.sort(key=lambda x: x["start"])
+    return out, warnings
+
+
+def pretty_article_number(number: str) -> str:
+    return re.sub(r"^(LO|L|R|D)(?=\d)", r"\1. ", number)
+
 
 def normalize_article_number(value: str) -> str:
     m = LEGAL_NUM_RE.search(value or "")
@@ -284,7 +350,12 @@ def indexed_article_numbers(entry: dict) -> set[str]:
     for field in (entry.get("numero"), entry.get("titre"), entry.get("evidence")):
         if not isinstance(field, str):
             continue
-        output.update(normalize_article_number(m.group()) for m in LEGAL_NUM_RE.finditer(field))
+        # Un hyperlien peut englober « L212-34 à L212-36 » tout en pointant
+        # vers un seul LEGIARTI. Ne JAMAIS attribuer son ID à tous les numéros
+        # contenus dans le libellé du lien.
+        numbers = {normalize_article_number(m.group()) for m in LEGAL_NUM_RE.finditer(field)}
+        if len(numbers) == 1:
+            output.update(numbers)
     return output - {""}
 
 
@@ -382,50 +453,52 @@ def code_for_mention(full_text: str, position: int, source_article: dict) -> str
 
 def resolve_textual_references(client: PisteClient, article: dict, entries: list[dict],
                                unresolved: list[str], day: dt.date, bulk: bool) -> tuple[list[dict], list[str], list[str]]:
-    """Complète l'indexation par NUM_ARTICLE + NOM_CODE + date, en restant prudent."""
+    """Résout individuellement tous les articles d'une plage via numéro + code."""
     raw = str(article.get("texteHtml") or article.get("texte") or article.get("content") or "")
     text = clean_text(raw)
+    mentions, range_notes = textual_mentions(text)
     todo_numbers = {normalize_article_number(label) for label in unresolved}
     todo_numbers.discard("")
     remaining = set(todo_numbers)
-    warnings: list[str] = []
+    warnings: list[str] = list(range_notes)
     limit = AUTO_RESOLVE_BULK_LIMIT if bulk else AUTO_RESOLVE_LIMIT
     if not callable(getattr(client, "search_article_number", None)):
         return entries, unresolved, warnings
     done: set[tuple[str, str]] = set()
     by_num = {n for entry in entries for n in indexed_article_numbers(entry)}
     count = 0
-    for match in LEGAL_NUM_RE.finditer(text):
-        number = normalize_article_number(match.group())
-        if number not in remaining or number in by_num:
-            continue
-        code = code_for_mention(text, match.start(), article)
-        if not code or (number, code) in done:
-            continue
-        done.add((number, code))
-        if count >= limit:
-            warnings.append(f"Recherche par numéro limitée à {limit} référence(s) par article : résultat partiel.")
-            break
-        count += 1
-        try:
-            candidates = client.search_article_number(number, code, day)
-        except APIError as exc:
-            warnings.append(f"Recherche de {number} ({code}) indisponible : {exc.message}")
-            continue
-        # Évite de confondre deux articles juridiques distincts partageant un numéro.
-        cids = {str(x.get("cid") or x.get("id")) for x in candidates}
-        if len(cids) != 1 or not candidates:
-            continue
-        candidates.sort(key=lambda x: (live_version(x, day), parsed_date(x.get("dateDebut")) or dt.date.min), reverse=True)
-        chosen = candidates[0]
-        ident = str(chosen["id"]).upper()
-        if ident not in {e["id"] for e in entries}:
-            entries.append({"id": ident, "numero": number, "titre": f"{code} - art. {number}",
-                            "sources": ["texte_litteral", "recherche_numero"],
-                            "evidence": f"Numéro {number} et code vérifiés par la recherche Légifrance",
-                            "nature": "CODE"})
-        remaining.discard(number)
-        by_num.add(number)
+    for mention in mentions:
+        # Dans une plage, le code figure fréquemment après le dernier numéro.
+        code = code_for_mention(text, mention["end"], article)
+        if not code:
+            code = code_for_mention(text, mention["start"], article)
+        for number in mention["numbers"]:
+            if number not in remaining or number in by_num or not code or (number, code) in done:
+                continue
+            done.add((number, code))
+            if count >= limit:
+                warnings.append(f"Recherche par numéro limitée à {limit} référence(s) par article : résultat partiel.")
+                return entries, [label for label in unresolved if normalize_article_number(label) in remaining], warnings
+            count += 1
+            try:
+                candidates = client.search_article_number(number, code, day)
+            except APIError as exc:
+                warnings.append(f"Recherche de {number} ({code}) indisponible : {exc.message}")
+                continue
+            cids = {str(x.get("cid") or x.get("id")) for x in candidates}
+            if len(cids) != 1 or not candidates:
+                continue
+            candidates.sort(key=lambda x: (live_version(x, day), parsed_date(x.get("dateDebut")) or dt.date.min), reverse=True)
+            chosen = candidates[0]
+            ident = str(chosen["id"]).upper()
+            if ident not in {e["id"] for e in entries}:
+                entries.append({"id": ident, "numero": number,
+                                "titre": f"{code} - art. {pretty_article_number(number)}",
+                                "sources": ["texte_litteral", "recherche_numero"],
+                                "evidence": f"Numéro {number} et code vérifiés par la recherche Légifrance",
+                                "nature": "CODE"})
+            remaining.discard(number)
+            by_num.add(number)
     return entries, [label for label in unresolved if normalize_article_number(label) in remaining], warnings
 
 def extract_references(article: dict, links: dict) -> tuple[list[dict], list[str]]:
@@ -437,7 +510,7 @@ def extract_references(article: dict, links: dict) -> tuple[list[dict], list[str
         if not (ARTICLE_RE.fullmatch(ident) or OTHER_RE.fullmatch(ident)):
             continue
         indexed[ident] = {
-            "id": ident, "titre": str(e.get("name") or ident),
+            "id": ident, "titre": re.sub(r"\s*\([Vv]\)$", "", str(e.get("name") or ident)),
             "sources": ["indexation"], "evidence": "Lien répertorié par Légifrance",
             "nature": str(e.get("nature") or ""),
         }
@@ -463,26 +536,30 @@ def extract_references(article: dict, links: dict) -> tuple[list[dict], list[str
         elif "/loda/" in href and not entry.get("nature"):
             entry["nature"] = "LODA"
 
-    # Rapprochement *prudent* par numéro : uniquement si une seule cible indexée
-    # correspond. On ne devine jamais un identifiant LEGIARTI à partir d'un numéro seul.
+    # Rapprochement par numéro. Une plage représente plusieurs articles, y
+    # compris ceux non écrits explicitement (L. 212-35 dans 34 à 36).
     plain = clean_text(source_html)
+    mentions, _ = textual_mentions(plain)
     by_number: dict[str, list[dict]] = {}
     for entry in indexed.values():
         for key in indexed_article_numbers(entry):
             by_number.setdefault(key, []).append(entry)
     unresolved: list[str] = []
-    for mention in LEGAL_NUM_RE.finditer(plain):
-        number = normalize_article_number(mention.group())
-        matches = by_number.get(number, [])
-        if len(matches) == 1:
-            entry = matches[0]
-            if "texte_litteral" not in entry["sources"]:
-                entry["sources"].append("texte_litteral")
-        else:
-            prefix = ARTICLE_PREFIX_RE.search(plain[max(0, mention.start()-18):mention.start()])
-            label = (prefix.group().strip() + " " if prefix else "") + mention.group().strip()
-            if label not in unresolved:
-                unresolved.append(label)
+    for mention in mentions:
+        for number in mention["numbers"]:
+            matches = by_number.get(number, [])
+            if len(matches) == 1:
+                entry = matches[0]
+                if "texte_litteral" not in entry["sources"]:
+                    entry["sources"].append("texte_litteral")
+            else:
+                if mention["plage"]:
+                    label = pretty_article_number(number)
+                else:
+                    prefix = ARTICLE_PREFIX_RE.search(plain[max(0, mention["start"]-18):mention["start"]])
+                    label = (prefix.group().strip() + " " if prefix else "") + mention["raw"].strip()
+                if label not in unresolved:
+                    unresolved.append(label)
     indexed.pop(str(article.get("id") or "").upper(), None)
     return list(indexed.values()), unresolved[:80]
 
@@ -586,7 +663,11 @@ def choose_source_version(client: PisteClient, input_id: str, day: dt.date, mode
 
 
 class SafeArticleRenderer(HTMLParser):
-    """Conserve le balisage légal sûr, annote les renvois textuels même sans <a>."""
+    """Rend le texte juridique sans faire passer un lien de plage pour un article.
+
+    Le HTML PISTE peut envelopper toute une plage dans un seul <a> LEGIARTI :
+    la coloration dépend donc des *numéros*, et pas du lien original.
+    """
     SAFE = {"p", "div", "span", "br", "ul", "ol", "li", "b", "strong", "i", "em", "u", "sup", "sub", "blockquote", "h2", "h3", "h4", "table", "thead", "tbody", "tr", "td", "th", "a"}
     VOID = {"br"}
     BLOCKED = {"script", "style", "iframe", "object", "embed", "svg", "math", "template", "form", "textarea", "button", "input"}
@@ -596,16 +677,16 @@ class SafeArticleRenderer(HTMLParser):
         self.parts: list[str] = []
         self.stack: list[tuple[str, str | None]] = []
         self.blocked_depth = 0
-        self.link_depth = 0
         self.by_id = {x["id"]: x for x in results}
+        self.pending_anchor: dict | None = None
         self.by_number: dict[str, list[dict]] = {}
         for entry in results:
-            for key in indexed_article_numbers(entry):
-                self.by_number.setdefault(key, []).append(entry)
+            for number in indexed_article_numbers(entry):
+                self.by_number.setdefault(number, []).append(entry)
         self.count_highlighted = 0
         self.mentioned_ids: set[str] = set()
 
-    def _color(self, text: str, entry: dict) -> str:
+    def _color(self, value: str, entry: dict) -> str:
         uid = entry["id"]
         status = entry.get("statut", "indetermine")
         if status not in {"vigoureux", "alerte", "ancienne_version", "indetermine"}:
@@ -616,7 +697,38 @@ class SafeArticleRenderer(HTMLParser):
         return (f'<a class="legal-ref status-{status}" href="{html.escape(dest, quote=True)}" '
                 f'target="_blank" rel="noopener noreferrer" data-ref="{uid}" '
                 f'title="{html.escape(entry.get("raison", "Voir sur Légifrance"), quote=True)}">'
-                f'{html.escape(text)}</a>')
+                f'{html.escape(value)}</a>')
+
+    def _color_range(self, value: str, numbers: list[str]) -> str:
+        references = []
+        for number in numbers:
+            matches = self.by_number.get(number, [])
+            references.append(matches[0] if len(matches) == 1 else None)
+        resolved = [x for x in references if x is not None]
+        statuses = {x.get("statut", "indetermine") for x in resolved}
+        all_found = len(resolved) == len(numbers)
+        if not all_found:
+            color = "nonresolu"
+        elif "alerte" in statuses:
+            color = "alerte"
+        elif "indetermine" in statuses:
+            color = "indetermine"
+        elif "ancienne_version" in statuses:
+            color = "ancienne_version"
+        else:
+            color = "vigoureux"
+        descriptions = []
+        for n, ref in zip(numbers, references):
+            description = {
+                "vigoureux": "en vigueur", "alerte": "à vérifier / abrogé",
+                "indetermine": "indéterminé", "ancienne_version": "ancienne version",
+            }.get(ref.get("statut"), "indéterminé") if ref else "non résolu"
+            descriptions.append(f"{pretty_article_number(n)} : {description}")
+        tip = f"Plage de {len(numbers)} articles : " + " ; ".join(descriptions)
+        self.mentioned_ids.update(x["id"] for x in resolved)
+        self.count_highlighted += 1
+        return (f'<mark class="legal-ref legal-range status-{color}" '
+                f'title="{html.escape(tip, quote=True)}">{html.escape(value)}</mark>')
 
     def handle_starttag(self, tag: str, attrs):
         tag = tag.lower()
@@ -629,24 +741,15 @@ class SafeArticleRenderer(HTMLParser):
             return
         if tag not in self.SAFE:
             return
+        if self.pending_anchor is not None:
+            # On collecte les textes d'un éventuel lien hypertexte PISTE ; son
+            # href ne doit jamais servir à assimiler toute une plage au 1er id.
+            if tag == "a":
+                self.pending_anchor["depth"] += 1
+            return
         if tag == "a":
             href = str(dict(attrs).get("href") or "")
-            hit = ARTICLE_RE.search(href) or OTHER_RE.search(href)
-            entry = self.by_id.get(hit.group(0).upper()) if hit else None
-            if entry:
-                # Lien <a> déjà fourni par PISTE : son contenu est coloré en une fois.
-                status = entry.get("statut", "indetermine")
-                if status not in {"vigoureux", "alerte", "ancienne_version", "indetermine"}:
-                    status = "indetermine"
-                uid = entry["id"]
-                dest = legal_article_url(uid, entry.get("nature", ""))
-                self.parts.append(f'<a class="legal-ref status-{status}" href="{html.escape(dest, quote=True)}" target="_blank" rel="noopener noreferrer" data-ref="{uid}" title="{html.escape(entry.get("raison", "Voir sur Légifrance"), quote=True)}">')
-                self.mentioned_ids.add(uid)
-                self.count_highlighted += 1
-            else:
-                self.parts.append('<span class="reference-unchecked" title="Lien non vérifié">')
-            self.stack.append(("a", "a" if entry else "span"))
-            self.link_depth += 1
+            self.pending_anchor = {"href": href, "parts": [], "depth": 1}
             return
         self.parts.append(f"<{tag}>")
         if tag not in self.VOID:
@@ -663,41 +766,68 @@ class SafeArticleRenderer(HTMLParser):
             if tag in self.BLOCKED:
                 self.blocked_depth -= 1
             return
+        if self.pending_anchor is not None:
+            if tag == "a":
+                self.pending_anchor["depth"] -= 1
+                if self.pending_anchor["depth"] == 0:
+                    link = self.pending_anchor
+                    self.pending_anchor = None
+                    href = link["href"]
+                    allowed = (href.startswith(("/codes/", "/loda/", "/jorf/"))
+                               or href.startswith("https://www.legifrance.gouv.fr/"))
+                    found = ARTICLE_RE.search(href) or OTHER_RE.search(href)
+                    entry = self.by_id.get(found.group(0).upper()) if allowed and found else None
+                    data = "".join(link["parts"])
+                    self._render_data(data, linked=entry)
+            return
         for idx in range(len(self.stack) - 1, -1, -1):
             if self.stack[idx][0] == tag:
                 for original, rendered in reversed(self.stack[idx:]):
-                    self.parts.append(f"</{rendered}>")
-                    if original == "a":
-                        self.link_depth = max(0, self.link_depth - 1)
+                    if rendered:
+                        self.parts.append(f"</{rendered}>")
                 del self.stack[idx:]
                 return
 
     def handle_data(self, data: str):
         if self.blocked_depth:
             return
-        if self.link_depth:
-            self.parts.append(html.escape(data))
+        if self.pending_anchor is not None:
+            self.pending_anchor["parts"].append(data)
             return
+        self._render_data(data)
+
+    def _render_data(self, data: str, linked: dict | None = None):
         last = 0
-        for match in LEGAL_NUM_RE.finditer(data):
-            self.parts.append(html.escape(data[last:match.start()]))
-            key = normalize_article_number(match.group())
-            refs = self.by_number.get(key, [])
-            # Aucune vérification fiable si plusieurs codes partagent le numéro.
-            if len(refs) == 1:
-                self.parts.append(self._color(match.group(), refs[0]))
+        mentions, _ = textual_mentions(data)
+        if not mentions and linked is not None:
+            self.parts.append(self._color(data, linked))
+            return
+        # L'hyperlien est probant uniquement s'il désigne UNE mention, pas une
+        # plage. La plage exige trois vérifications de numéros distinctes.
+        forced = linked if len(mentions) == 1 and not mentions[0]["plage"] else None
+        for mention in mentions:
+            self.parts.append(html.escape(data[last:mention["start"]]))
+            if mention["plage"]:
+                self.parts.append(self._color_range(mention["raw"], mention["numbers"]))
             else:
-                self.parts.append('<mark class="legal-ref status-nonresolu" title="Référence textuelle non identifiée avec certitude (code ou identifiant LEGIARTI à vérifier)">' + html.escape(match.group()) + '</mark>')
-            last = match.end()
+                number = mention["numbers"][0]
+                refs = self.by_number.get(number, [])
+                if len(refs) == 1:
+                    self.parts.append(self._color(mention["raw"], refs[0]))
+                elif forced is not None:
+                    self.parts.append(self._color(mention["raw"], forced))
+                else:
+                    self.parts.append('<mark class="legal-ref status-nonresolu" title="Référence textuelle non identifiée avec certitude">' + html.escape(mention["raw"]) + '</mark>')
+            last = mention["end"]
         self.parts.append(html.escape(data[last:]))
 
     def render(self, markup: str) -> str:
         self.feed(markup)
         self.close()
         for original, rendered in reversed(self.stack):
-            self.parts.append(f"</{rendered}>")
+            if rendered:
+                self.parts.append(f"</{rendered}>")
         return "".join(self.parts)
-
 
 def legal_article_url(ident: str, nature: str = "") -> str:
     if ident.startswith("JORFARTI"):
@@ -884,8 +1014,11 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
         links = {}
         warnings.append("Citations indexées indisponibles : " + exc.message)
     entries, unresolved = extract_references(original, links)
+    raw_source = str(original.get("texteHtml") or original.get("texte") or original.get("content") or "")
+    _, range_warnings = textual_mentions(clean_text(raw_source))
+    warnings.extend(range_warnings)
     entries, unresolved, lookup_warnings = resolve_textual_references(client, original, entries, unresolved, today, bulk)
-    warnings.extend(lookup_warnings)
+    warnings.extend(x for x in lookup_warnings if x not in warnings)
     total = len(entries)
     ref_limit = min(MAX_REFERENCES, BULK_REF_LIMIT) if bulk else MAX_REFERENCES
     if total > ref_limit:

@@ -26,14 +26,14 @@ class Client:
 class PlainTextRegression(unittest.TestCase):
     def test_screenshot_case(self):
         r=server.analyze(Client(),SOURCE,dt.date(2026,11,11))
-        self.assertEqual(r['renvoisSurlignes'],1)
+        self.assertEqual(r['renvoisSurlignes'],2)
         self.assertEqual(r['comptes']['alerte'],1)
         self.assertIn('status-alerte',r['sourceHtmlAnnote'])
         self.assertIn('>L. 212-33</a>',r['sourceHtmlAnnote'])
         self.assertEqual(len(r['mentionsNonResolues']),3)
         self.assertIn('>L. 212-4</mark>',r['sourceHtmlAnnote'])
-        self.assertIn('>L. 212-4-1</mark>',r['sourceHtmlAnnote'])
-        self.assertIn('>L. 212-10</mark>',r['sourceHtmlAnnote'])
+        self.assertIn('L. 212-4-1 à L. 212-10</mark>',r['sourceHtmlAnnote'])
+        self.assertIn('Plage complexe', ' '.join(r['avertissements']))
         self.assertFalse(any('Aucun hyperlien' in x for x in r['avertissements']))
 
     def test_number_not_prefix(self):
