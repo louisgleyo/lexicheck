@@ -78,10 +78,12 @@ class RenvoisTests(unittest.TestCase):
     def test_only_cites_outbound(self):
         c=FakeClient({A:{'id':A,'num':'123', 'etat':'VIGUEUR','dateDebut':'2020-01-01','dateFin':'2999-01-01','texteHtml':'Sans renvoi.'}, B:{'id':B,'etat':'VIGUEUR','dateDebut':'2020-01-01','dateFin':'2999-01-01'}})
         res=server.analyze(c,A,self.day)
-        self.assertEqual(len(res['renvois']),1)
-        self.assertEqual(res['renvois'][0]['id'],B)
-        self.assertNotIn(C,[x['id'] for x in res['renvois']])
-        self.assertEqual(res['comptes']['vigoureux'],1)
+        # v3.6 : un lien indexé qui n'apparaît pas dans la rédaction
+        # est conservé comme métadonnée séparée, pas comme citation du texte.
+        self.assertEqual(res['renvois'],[])
+        self.assertEqual([x['id'] for x in res['liensIndexationSeule']],[B])
+        self.assertNotIn(C,[x['id'] for x in res['liensIndexationSeule']])
+        self.assertEqual(res['comptes']['vigoureux'],0)
 
     def test_current_source_is_selected_using_cid(self):
         old = {'id': A, 'cid': C, 'num': '156', 'etat': 'MODIFIE',

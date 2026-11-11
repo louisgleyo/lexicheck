@@ -1,33 +1,45 @@
-# LexiCheck v3.5 — Renvois aux lois, ordonnances et décrets numérotés
+# LexiCheck v3.6 — cohérence texte / résultats
 
-## Pourquoi cette version ?
+Cette version corrige deux problèmes identifiés sur l'article L. 4141-2 du CGCT :
 
-La version précédente savait identifier « article L. 212-34 du code du patrimoine », mais **pas** « l'article 3 de la loi n° 84-53 du 26 janvier 1984 ». Elle proposait donc des concordances concernant le Code minier tout en omettant le renvoi réellement problématique de **l'article L. 4141-2 du CGCT**.
+1. Les références vers une **loi non codifiée**, comme « l'article 3 de la loi n° 84-53 », peuvent être réparties entre plusieurs balises HTML (`span`, `strong`, liens). Elles sont désormais reconnues et annotées dans le flux textuel entier, même si l'API ne parvient pas à retrouver leur article cible. Dans ce dernier cas, la référence reste **violette**, et une correction explicitement documentée par le Sénat est signalée comme telle, **sans prétendre être une concordance API**.
+2. Un lien présent dans les **métadonnées d'indexation** ne prouve pas qu'il est cité dans la rédaction. Les liens non retrouvés dans le texte sont désormais affichés séparément, dans un panneau replié, et **ne sont plus comptés dans les statistiques de renvois du texte**, y compris en analyse par lots.
 
-## Corrections
+### Article 3 de la loi de 1984
 
-- Reconnaissance des renvois explicites du type `article 3 de la loi n° 84-53` (également pour les ordonnances et décrets numérotés). Les subdivisions `1° et 2°` précédant le renvoi ne sont pas prises pour des numéros d'articles.
-- Recherche `POST /search` de PISTE dans le fonds `LODA_DATE` avec les champs `NUM` et `NUM_ARTICLE`. Si aucune version actuelle n'est trouvée, recherche à des dates historiques. Validation du numéro d'article et du numéro et type du texte avant de retenir un identifiant LEGIARTI.
-- Affichage et coloration dans le texte de la mention « l'article 3 de la loi n° 84-53 », y compris lorsqu'il n'y a pas d'hyperlien Légifrance. Si le numéro de texte ou l'article est ambigu, la mention reste non résolue.
-- Pour le cas documenté **CGCT L. 4141-2 et L. 3131-2 → loi 84-53, article 3**, suggestion de remplacement **« I de l'article L. 332-23 du code général de la fonction publique »**, explicitement attribuée au **rapport du Sénat n° 260 (2023-2024)** (https://www.senat.fr/rap/l23-260/l23-2604.html). Cette suggestion documentée n'est **pas** une concordance automatiquement découverte dans l'API. Elle est présentée « correction à vérifier », et jamais comme remplacement de rédaction identique.
-- Lien correct vers le Code général de la fonction publique depuis la suggestion.
+La recherche classique dans LODA est conservée. Si elle échoue pour l'article 3 de la loi n° 84-53, le serveur tente une consultation directe de l'identifiant historique connu `LEGIARTI000038922660`. Il ne le retient **que si l'API confirme le numéro de l'article et le titre de la loi**. En cas d'échec, l'article reste « non résolu » et seule la suggestion documentaire du Sénat est affichée : remplacement par « I de l'article L. 332-23 du Code général de la fonction publique ». Source : https://www.senat.fr/rap/l23-260/l23-2604.html
 
-## Déploiement Render
+### Autres améliorations
 
-Dans ton dépôt GitHub, remplace `server.py` et `static/app.js` (les autres fichiers ne changent pas). Fais **Commit changes**, puis laisse Render redéployer automatiquement. Pas de nouvelle dépendance, pas de nouvelle variable d'environnement, ne publie pas tes clés PISTE.
+- Les plages comme `L. 212-34 à L. 212-36` conservent leur vérification article par article, même si un hyperlien couvre toute la plage.
+- Les références figurant dans plusieurs éléments HTML inline sont repérées sans supprimer les paragraphes ni la mise en forme du texte.
+- La version `3.6.0` apparaît dans l'en-tête et dans `/api/health`, ainsi que dans le résultat de l'analyse, afin de diagnostiquer un déploiement non actualisé sur Render.
+- Les fichiers CSS et JS portent un numéro de version dans leur URL, afin d'éviter un décalage entre l'ancien frontend et le nouveau serveur.
 
-Paramètres inchangés :
-- Build Command : `echo "No dependencies"`
-- Start Command : `python server.py`
+### Déploiement Render
 
-## Limites
+Dans le dépôt GitHub déjà connecté à Render, remplacer **les quatre fichiers** :
 
-Le moteur ne détecte pas encore tous les modèles de citations législatives (par exemple « article 3 de la loi précitée » ou les mentions cassées entre plusieurs éléments HTML). La recherche LODA a été vérifiée avec des réponses PISTE **simulées**, pas avec un accès réel à tes clés API. L'attribution d'une correspondance ne prouve pas l'équivalence juridique des dispositions.
+- `server.py`
+- `static/app.js`
+- `static/index.html`
+- `static/style.css`
 
-## Tests
+Conserver les autres fichiers (dont les mentions légales) et les variables d'environnement déjà configurées. Commit puis attendre la fin du déploiement. Vérifier le champ `version` à `https://VOTRE-SITE.onrender.com/api/health` : il doit valoir `3.6.0`. Actualiser ensuite la page et vérifier que l'en-tête indique `v3.6.0`.
+
+Configuration Render inchangée :
+
+- Build : `echo "No dependencies"`
+- Start : `python server.py`
+
+### Tests
 
 ```bash
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -q
 ```
 
-44 tests locaux, dont 5 tests sur les renvois non codifiés et un scénario d'analyse intégrée reproduisant l'article L. 4141-2.
+49 tests locaux réussis au moment de l'export, dont 5 nouveaux tests reproduisant : extraction à travers plusieurs balises HTML, résolution par article historique après échec de `/search`, conservation d'un statut indéterminé si l'API ne confirme pas l'article, séparation des liens indexés, et assainissement du HTML.
+
+### Limite importante
+
+Les appels PISTE n'ont **pas** été testés ici avec des identifiants réels. L'API peut renvoyer des champs différents des réponses simulées. Une correspondance documentaire ou lexicale ne constitue jamais une validation juridique de la substitution proposée.
