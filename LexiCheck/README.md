@@ -1,58 +1,33 @@
-# LexiCheck v3.3 — Correction de l'analyse des plages d'articles
+# LexiCheck v3.5 — Renvois aux lois, ordonnances et décrets numérotés
 
-Cette version corrige notamment le cas **CGCT, art. L. 1421-3** : « articles L. 212-34 à L. 212-36 du code du patrimoine ».
+## Pourquoi cette version ?
 
-## Changements
+La version précédente savait identifier « article L. 212-34 du code du patrimoine », mais **pas** « l'article 3 de la loi n° 84-53 du 26 janvier 1984 ». Elle proposait donc des concordances concernant le Code minier tout en omettant le renvoi réellement problématique de **l'article L. 4141-2 du CGCT**.
 
-- Les plages simples sont **décomposées en autant d'articles à vérifier** (ici L. 212-34, L. 212-35 et L. 212-36), au lieu de traiter uniquement le premier identifiant trouvé dans l'indexation.
-- Chaque numéro est résolu par une recherche `NUM_ARTICLE` + `NOM_CODE`, y compris dans les anciennes versions si la disposition n'est plus en vigueur. Chaque article est ensuite inspecté individuellement.
-- Un hyperlien Légifrance couvrant une plage n'est plus considéré comme la preuve que tous les articles de la plage pointent vers le même `LEGIARTI`.
-- Dans le texte, la **plage entière est annotée** et l'infobulle présente le statut de chaque numéro. Si certains numéros ne peuvent pas être résolus, la plage reste en violet (« non résolu »), même si un autre numéro est abrogé.
-- La liste « Renvois identifiés » affiche chaque article résolu séparément. La ligne de synthèse distingue le nombre de **passages annotés** du nombre d'**articles cibles vérifiés**.
-- Les suffixes `(V)` présents dans les libellés d'indexation sont masqués dans les titres : ce ne sont pas des indications suffisantes sur la vigueur actuelle de l'article cible.
-- Les plages complexes, comme « L. 212-4-1 à L. 212-10 », ne sont **pas développées arbitrairement**. Les bornes sont examinées et un avertissement indique que l'énumération peut être incomplète.
-- Un champ de date manquant n'affiche plus « version du » suivi de rien.
+## Corrections
 
-## Installation sur ton Render actuel
+- Reconnaissance des renvois explicites du type `article 3 de la loi n° 84-53` (également pour les ordonnances et décrets numérotés). Les subdivisions `1° et 2°` précédant le renvoi ne sont pas prises pour des numéros d'articles.
+- Recherche `POST /search` de PISTE dans le fonds `LODA_DATE` avec les champs `NUM` et `NUM_ARTICLE`. Si aucune version actuelle n'est trouvée, recherche à des dates historiques. Validation du numéro d'article et du numéro et type du texte avant de retenir un identifiant LEGIARTI.
+- Affichage et coloration dans le texte de la mention « l'article 3 de la loi n° 84-53 », y compris lorsqu'il n'y a pas d'hyperlien Légifrance. Si le numéro de texte ou l'article est ambigu, la mention reste non résolue.
+- Pour le cas documenté **CGCT L. 4141-2 et L. 3131-2 → loi 84-53, article 3**, suggestion de remplacement **« I de l'article L. 332-23 du code général de la fonction publique »**, explicitement attribuée au **rapport du Sénat n° 260 (2023-2024)** (https://www.senat.fr/rap/l23-260/l23-2604.html). Cette suggestion documentée n'est **pas** une concordance automatiquement découverte dans l'API. Elle est présentée « correction à vérifier », et jamais comme remplacement de rédaction identique.
+- Lien correct vers le Code général de la fonction publique depuis la suggestion.
 
-À partir du ZIP, dans ton dépôt GitHub, remplace :
+## Déploiement Render
 
-1. `server.py`
-2. `static/app.js`
-3. `static/style.css`
+Dans ton dépôt GitHub, remplace `server.py` et `static/app.js` (les autres fichiers ne changent pas). Fais **Commit changes**, puis laisse Render redéployer automatiquement. Pas de nouvelle dépendance, pas de nouvelle variable d'environnement, ne publie pas tes clés PISTE.
 
-Fais **Commit changes**. Render redéploiera le site automatiquement si Auto Deploy est activé. Il n'y a **aucune nouvelle dépendance**, aucune nouvelle variable obligatoire, et il ne faut **pas publier de clé PISTE** dans GitHub.
+Paramètres inchangés :
+- Build Command : `echo "No dependencies"`
+- Start Command : `python server.py`
 
-Les paramètres existants restent inchangés : Build `echo "No dependencies"`, Start `python server.py`, `PISTE_CLIENT_ID`, `PISTE_CLIENT_SECRET`, `PISTE_ENV=production`, `HOST=0.0.0.0`.
+## Limites
 
-## Vérification
+Le moteur ne détecte pas encore tous les modèles de citations législatives (par exemple « article 3 de la loi précitée » ou les mentions cassées entre plusieurs éléments HTML). La recherche LODA a été vérifiée avec des réponses PISTE **simulées**, pas avec un accès réel à tes clés API. L'attribution d'une correspondance ne prouve pas l'équivalence juridique des dispositions.
+
+## Tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-**36 tests locaux** passent, dont un scénario simulant le lien HTML de L. 212-34 englobant la plage complète : le résultat contient alors 3 articles à contrôler.
-
-⚠️ **Limite :** ces tests utilisent des réponses simulées de PISTE. Il faut encore vérifier le comportement exact avec les données de production. La recherche par numéro peut être ambiguë, incomplète ou limitée par les quotas, auquel cas le statut reste « non résolu ». Le fait qu'un texte ancien soit abrogé ne suffit pas à établir qu'un renvoi est juridiquement erroné.
-
-Concernant ce cas précis, le Conseil d'État, dans son avis du 25 mai 2023 relatif à la lisibilité du droit des collectivités locales, mentionne l'article L. 123-3 du Code du patrimoine comme nouveau renvoi pertinent. Cela ne prouve pas que les trois anciens articles ont une rédaction identique à L. 123-3 : l'outil ne doit pas proposer de remplacement « identique » sans comparaison fiable.
-
-## Fonctionnalités conservées
-
-- Analyse d'un article (version actuelle ou historique), d'une section ou d'un code par lots.
-- Recherche de renvois dans l'indexation, les hyperliens et les références rédigées en toutes lettres.
-- Suggestions de concordances, avec comparaison des contenus lorsqu'ils sont disponibles.
-- Export CSV, interface épurée, mentions légales, option de mot de passe `APP_ACCESS_PASSWORD`.
-- Backend Python 3.10+ sans bibliothèque tierce et secrets OAuth côté serveur.
-
-Données : Légifrance / DILA. LexiCheck est une application indépendante, sans valeur juridique officielle.
-
-## Correctif v3.4 — versions historiques incohérentes (11 novembre 2026)
-
-Un article peut avoir plusieurs versions référencées par Légifrance, dont certaines versions « mort-nées » avec `dateDebut >= dateFin`. Un exemple réel est **L. 212-36 du Code du patrimoine** : la version `LEGIARTI000033463442` n'a pas de période de validité cohérente, tandis que `LEGIARTI000035110347` confirme son abrogation au 1er janvier 2018.
-
-Le résolveur vérifie maintenant les versions retournées par la recherche, explore le fonds historique lorsqu'il ne dispose pas d'une confirmation d'abrogation, écarte les versions dont les dates sont inversées et donne la priorité aux versions établissant explicitement l'abrogation. Si le résultat reste ambigu, il ne transforme pas une simple fin de version `MODIFIE` en abrogation certaine.
-
-Cette amélioration peut augmenter le nombre d'appels PISTE pour les références historiques. Les tests sont simulés : il faut encore valider les réponses de l'API PISTE en production.
-
-**Déploiement :** remplacer uniquement `server.py` dans le dépôt GitHub et enregistrer le commit. Render utilisera les identifiants déjà configurés.
+44 tests locaux, dont 5 tests sur les renvois non codifiés et un scénario d'analyse intégrée reproduisant l'article L. 4141-2.

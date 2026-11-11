@@ -232,6 +232,79 @@ class PisteClient:
         return [obj for ident in cached_ids if (obj := verified(ident)) is not None]
 
 
+    def search_loda_article_number(self, number: str, text_number: str, day: dt.date, kind: str = "loi") -> list[dict]:
+        """Recherche un article d'une loi/ordonnance/décret par NUM et NUM_ARTICLE.
+
+        Aucun numéro d'article n'est considéré unique sans son numéro de texte.
+        La recherche à une date historique permet de retrouver les abrogations.
+        """
+        number = re.sub(r"\s+", " ", str(number or "")).strip()
+        text_number = normalize_text_number(text_number)
+        if not re.fullmatch(r"\d+(?:-\d+){0,3}(?: (?:bis|ter|quater))?", number, re.I):
+            return []
+        if not re.fullmatch(r"\d{2,4}-\d{1,6}", text_number):
+            return []
+        cache_key = ("LODA:" + kind + ":" + number, text_number, day.isoformat())
+        with self._cache_lock:
+            cached = self._lookup_cache.get(cache_key)
+        if cached is not None:
+            return [self.article(i) for i in cached]
+
+        found: dict[str, dict] = {}
+        def fetch(fond: str, at_date: dt.date | None):
+            filters = []
+            if at_date is not None:
+                millis = int(dt.datetime.combine(at_date, dt.time(12), tzinfo=dt.timezone.utc).timestamp() * 1000)
+                filters.append({"facette": "DATE_VERSION", "singleDate": millis})
+            body = {"fond": fond, "recherche": {
+                "champs": [
+                    {"typeChamp": "NUM", "criteres": [{"typeRecherche": "EXACTE", "valeur": text_number,
+                                                          "operateur": "ET"}], "operateur": "ET"},
+                    {"typeChamp": "NUM_ARTICLE", "criteres": [{"typeRecherche": "EXACTE", "valeur": number,
+                                                                  "operateur": "ET"}], "operateur": "ET"},
+                ], "filtres": filters, "pageNumber": 1, "pageSize": 30,
+                "operateur": "ET", "sort": "PERTINENCE", "typePagination": "DEFAUT"
+            }}
+            for ident in ids_in_search_response(self.call("search", body)):
+                if ident in found or len(found) >= 40:
+                    continue
+                try:
+                    article = self.article(ident)
+                except APIError:
+                    continue
+                if str(article.get("num") or "").strip().casefold() != number.casefold():
+                    continue
+                titles = article_code_titles(article)
+                # Contrôle anti-homonymie : ne jamais accepter un article de CODE,
+                # ni d'une autre loi ayant le même numéro d'article.
+                if not titles:
+                    continue
+                title = " ".join(titles).lower()
+                if not re.search(rf"(?<!\d){re.escape(text_number)}(?!\d)", title):
+                    continue
+                if kind not in title:
+                    continue
+                found[ident] = article
+
+        fetch("LODA_DATE", day)
+        if not any(live_version(a, day) for a in found.values()):
+            # Les textes abrogés peuvent n'apparaître que pour une date passée.
+            # Priorité à 2022 pour la codification de la fonction publique.
+            for past in (dt.date(2022, 2, 28), dt.date(2020, 1, 1),
+                         dt.date(2017, 1, 1), dt.date(2012, 1, 1),
+                         dt.date(2005, 1, 1), dt.date(1995, 1, 1)):
+                if past >= day:
+                    continue
+                fetch("LODA_DATE", past)
+                if any(terminal_abrogation(a, day) for a in found.values()):
+                    break
+        with self._cache_lock:
+            if len(self._lookup_cache) > 500:
+                self._lookup_cache.clear()
+            self._lookup_cache[cache_key] = list(found)
+        return list(found.values())
+
+
 class AnchorCollector(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -292,6 +365,30 @@ RANGE_RE = re.compile(
     re.I,
 )
 MAX_RANGE_ARTICLES = max(2, min(int(os.environ.get("MAX_RANGE_ARTICLES", "40")), 80))
+
+# Renvois vers les textes autonomes : « l'article 3 de la loi n° 84-53 ».
+# Les subdivisions 1° et 2° qui précèdent l'article sont conservées dans le
+# texte affiché, mais ne doivent PAS être interprétées comme les articles 1 et 2.
+NORMATIVE_RE = re.compile(
+    r"(?<![\w.-])(?P<reference>(?:l['’])?articles?\s+"
+    r"(?P<article>\d+(?:\s*-\s*\d+){0,3}(?:\s+(?:bis|ter|quater))?)"
+    r"\s+de\s+(?:la|l['’])\s*(?P<type>loi|ordonnance|décret)\s+"
+    r"(?:n[°ºo]\s*|numéro\s+)(?P<texte>\d{2,4}\s*[-–‑]\s*\d{1,6}))",
+    re.IGNORECASE,
+)
+
+
+def normalize_text_number(value: str) -> str:
+    return re.sub(r"\s*[-–‑]\s*", "-", str(value or "")).strip()
+
+
+def normative_mentions(text: str) -> list[dict]:
+    return [{"start": m.start(), "end": m.end(), "raw": m.group("reference"),
+             "numero": re.sub(r"\s+", " ", m.group("article")).strip(),
+             "texteNumero": normalize_text_number(m.group("texte")),
+             "typeTexte": m.group("type").lower()}
+            for m in NORMATIVE_RE.finditer(text)]
+
 
 
 def expand_article_range(first: str, last: str) -> list[str] | None:
@@ -514,6 +611,52 @@ def resolve_textual_references(client: PisteClient, article: dict, entries: list
             by_num.add(number)
     return entries, [label for label in unresolved if normalize_article_number(label) in remaining], warnings
 
+
+def resolve_normative_references(client: PisteClient, article: dict, entries: list[dict],
+                                 unresolved: list[str], day: dt.date, bulk: bool
+                                 ) -> tuple[list[dict], list[str], list[str]]:
+    """Résout « article 3 de la loi n°84-53 » sans confondre avec un code."""
+    plain = clean_text(str(article.get("texteHtml") or article.get("texte") or ""))
+    mentions = normative_mentions(plain)
+    if not mentions:
+        return entries, unresolved, []
+    warnings = []
+    limit = AUTO_RESOLVE_BULK_LIMIT if bulk else AUTO_RESOLVE_LIMIT
+    search = getattr(client, "search_loda_article_number", None)
+    for index, mention in enumerate(mentions):
+        key = (mention["numero"], mention["texteNumero"], mention["typeTexte"])
+        existing = [e for e in entries if (e.get("numero"), e.get("texteNumero"), e.get("typeTexte")) == key]
+        if existing:
+            continue
+        if index >= limit or not callable(search):
+            if mention["raw"] not in unresolved:
+                unresolved.append(mention["raw"])
+            warnings.append("Références à des textes non codifiés partiellement vérifiées.")
+            continue
+        try:
+            candidates = search(*key[:2], day, key[2])
+        except APIError as exc:
+            candidates = []
+            warnings.append("Recherche d'un texte non codifié indisponible : " + exc.message)
+        cids = {str(x.get("cid") or x.get("id")) for x in candidates}
+        if len(cids) != 1 or not candidates:
+            if mention["raw"] not in unresolved:
+                unresolved.append(mention["raw"])
+            continue
+        candidates.sort(key=lambda x: reference_version_rank(x, day), reverse=True)
+        chosen = candidates[0]
+        ident = str(chosen.get("id") or "").upper()
+        if not ARTICLE_RE.fullmatch(ident):
+            unresolved.append(mention["raw"])
+            continue
+        entry = next((e for e in entries if e["id"] == ident), None)
+        if entry is None:
+            entry = {"id": ident, "nature": "LODA", "sources": ["texte_litteral", "recherche_numero"],
+                     "evidence": mention["raw"], "titre": f"{key[2].capitalize()} n° {key[1]} – art. {key[0]}"}
+            entries.append(entry)
+        entry.update({"numero": key[0], "texteNumero": key[1], "typeTexte": key[2], "nature": "LODA"})
+    return entries, unresolved, list(dict.fromkeys(warnings))
+
 def extract_references(article: dict, links: dict) -> tuple[list[dict], list[str]]:
     indexed: dict[str, dict] = {}
     for e in links.get("liensCite", []) or []:
@@ -719,6 +862,11 @@ class SafeArticleRenderer(HTMLParser):
         for entry in results:
             for number in indexed_article_numbers(entry):
                 self.by_number.setdefault(number, []).append(entry)
+        self.by_normative: dict[tuple[str, str, str], list[dict]] = {}
+        for entry in results:
+            if entry.get("texteNumero") and entry.get("numero"):
+                key = (str(entry["numero"]), str(entry["texteNumero"]), str(entry.get("typeTexte") or "loi"))
+                self.by_normative.setdefault(key, []).append(entry)
         self.count_highlighted = 0
         self.mentioned_ids: set[str] = set()
 
@@ -835,6 +983,16 @@ class SafeArticleRenderer(HTMLParser):
     def _render_data(self, data: str, linked: dict | None = None):
         last = 0
         mentions, _ = textual_mentions(data)
+        # Une même séquence de texte peut contenir des articles de codes et
+        # des articles de lois non codifiées. Fusionner les occurrences selon
+        # leur position, sans jamais transformer le 1° et le 2° en articles.
+        norm = normative_mentions(data)
+        for m in norm:
+            mentions.append({"start": m["start"], "end": m["end"], "raw": m["raw"],
+                             "normative": m, "plage": False})
+        mentions.sort(key=lambda x: x["start"])
+        mentions = [m for i, m in enumerate(mentions) if not any(
+            o["start"] <= m["start"] < o["end"] for o in mentions if o is not m and o.get("normative"))]
         if not mentions and linked is not None:
             self.parts.append(self._color(data, linked))
             return
@@ -843,7 +1001,15 @@ class SafeArticleRenderer(HTMLParser):
         forced = linked if len(mentions) == 1 and not mentions[0]["plage"] else None
         for mention in mentions:
             self.parts.append(html.escape(data[last:mention["start"]]))
-            if mention["plage"]:
+            if mention.get("normative"):
+                n = mention["normative"]
+                key = (n["numero"], n["texteNumero"], n["typeTexte"])
+                matches = self.by_normative.get(key, [])
+                if len(matches) == 1:
+                    self.parts.append(self._color(mention["raw"], matches[0]))
+                else:
+                    self.parts.append('<mark class="legal-ref status-nonresolu" title="Texte non codifié non identifié avec certitude">' + html.escape(mention["raw"]) + '</mark>')
+            elif mention["plage"]:
                 self.parts.append(self._color_range(mention["raw"], mention["numbers"]))
             else:
                 number = mention["numbers"][0]
@@ -1059,6 +1225,8 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
     warnings.extend(range_warnings)
     entries, unresolved, lookup_warnings = resolve_textual_references(client, original, entries, unresolved, today, bulk)
     warnings.extend(x for x in lookup_warnings if x not in warnings)
+    entries, unresolved, loda_warnings = resolve_normative_references(client, original, entries, unresolved, today, bulk)
+    warnings.extend(x for x in loda_warnings if x not in warnings)
     total = len(entries)
     ref_limit = min(MAX_REFERENCES, BULK_REF_LIMIT) if bulk else MAX_REFERENCES
     if total > ref_limit:
@@ -1066,6 +1234,30 @@ def analyze(client: PisteClient, value: str, today: dt.date | None = None, mode:
         entries = entries[:ref_limit]
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         checked = list(pool.map(lambda entry: inspect_reference(client, entry, today), entries))
+    # Une correspondance explicitement documentée dans un rapport parlementaire
+    # peut être affichée à titre de suggestion vérifiable, mais PAS comme une
+    # correction déduite automatiquement de l'identité des deux rédactions.
+    source_num = normalize_article_number(str(original.get("num") or ""))
+    source_is_cgct = any(normalize_code_title(x) == normalize_code_title("Code général des collectivités territoriales")
+                         for x in article_code_titles(original))
+    for ref in checked:
+        if (source_is_cgct and source_num in {"L4141-2", "L3131-2"}
+            and ref.get("numero") == "3" and ref.get("texteNumero") == "84-53"
+            and ref.get("typeTexte") == "loi" and ref.get("statut") == "alerte"):
+            target_id = "LEGIARTI000044426650"  # Code général de la fonction publique, L332-23
+            try:
+                target = client.article(target_id)
+                if live_version(target, today) and normalize_article_number(str(target.get("num") or "")) == "L332-23":
+                    comparison = propose_replacement(client, client.article(ref["id"]),
+                                                     [{"id": target_id}], today)
+                    comparison.update({"statut": "verification", "id": target_id,
+                                       "nature": "CODE",
+                                       "libelle": "Correction à vérifier · remplacement préconisé par le Sénat",
+                                       "sourceDocumentaire": "https://www.senat.fr/rap/l23-260/l23-2604.html",
+                                       "referenceRecommandee": "I de l'article L. 332-23 du code général de la fonction publique"})
+                    ref["suggestion"] = comparison
+            except APIError:
+                pass
     checked.sort(key=lambda x: {"alerte": 0, "indetermine": 1, "ancienne_version": 2, "vigoureux": 3}.get(x["statut"], 4))
     counts = {key: sum(x["statut"] == key for x in checked) for key in ("alerte", "indetermine", "ancienne_version", "vigoureux")}
     decorated, colored, actual_ids = render_annotated_html(original, checked) if not bulk else ("", 0, set())
